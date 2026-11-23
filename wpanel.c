@@ -1,8 +1,8 @@
 /*
- * WingPanel.c - a 12-strip remote panel for a Behringer WING, using wapi.
+ * WingPanel.c - a variable size strip remote panel for a Behringer WING, using wapi.
  * Windows (Win32) GUI.
  *
- *   gcc -O2 -Wall -I<wapi include dir> -o WingPanel.exe WingPanel.c \
+ *   gcc -O3 -Wall -I<wapi include dir> -o wpanel.exe wpanel.c \
  *       -L<wapi lib dir> -lwapi -lws2_32 -lgdi32 -mwindows
  *
  * Layout: 12 strips in three groups of four, modelled on the console's own
