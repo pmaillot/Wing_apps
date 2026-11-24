@@ -1,5 +1,6 @@
 /*
- * WingPanel.c - a variable size strip remote panel for a Behringer WING, using wapi.
+ * wpanel.c - a variable size strip remote panel for a Behringer WING, using wapi.
+ * wpanel v 0.1.0 - (c) 2026 - Patrick-Gilles Maillot
  * Windows (Win32) GUI.
  *
  *   gcc -O3 -Wall -I<wapi include dir> -o wpanel.exe wpanel.c \
@@ -44,7 +45,8 @@
 #define RESYNC_WAIT_US 50000     /* per-token wait during a resync (µs)       */
 
 /* meters (wapi metering API) */
-#define METER_PORT     10026     /* first UDP port tried for meter data       */
+#define METER_PORT     10026     /* first UDP port of the range tried for meters */
+#define METER_PORTS    50        /* size of that range                        */
 #define METER_RENEW_MS 4000      /* the WING stops sending after 5 s          */
 #define METER_REPAINT_MS 40      /* at most one meter repaint per this many ms */
 #define METER_WAIT_US  100       /* wait per read when polling for meter data */
@@ -59,9 +61,12 @@
 /* Source number s equals the console's own strip index (0 = CH 1 ... 39 = CH 40,
  * 40 = AUX 1 ... 47 = AUX 8, 48..63 = BUS 1..16, 64..67 = MAIN 1..4, 68..75 = MTX 1..8), which is also what the selected-strip token uses. */
 typedef struct {
-	wtoken mute, solo, name, col, fdr, dname, dyn_on, gate_on;
+	wtoken mute, solo, name, col, fdr, dname, dyn_on, gate_on, clink;
 } Source;
 #define HAS_GATE(s) ((s) < 40)       /* only the input channels have a gate */
+#define HAS_LINK(s) ((s) < 48)       /* "link to source" exists on channels and aux only */
+#define CLINK_LINKED 1               /* value of the clink token when linked to the source
+                                      * (clink = "custom link"; with the value below the padlock is drawn closed) */
 /* The tokens of each source family (CH, AUX, BUS, MAIN, MTX) are laid out at a
  * constant distance in wapi.h's enum: CH_2_MUTE - CH_1_MUTE is the same for every
  * channel and for every field. So each family is described by its first two
@@ -71,12 +76,17 @@ typedef struct {
 #define NSRC 76
 
 #define FIELDS(P, N) { P##_##N##_MUTE, P##_##N##_$SOLO, P##_##N##_NAME, P##_##N##_COL, \
-                       P##_##N##_FDR,  P##_##N##_$NAME, P##_##N##_DYN_ON, GATE_##P(N) }
+                       P##_##N##_FDR,  P##_##N##_$NAME, P##_##N##_DYN_ON, GATE_##P(N), LINK_##P(N) }
 #define GATE_CH(N)   CH_##N##_GATE_ON          /* only input channels have a gate; */
 #define GATE_AUX(N)  AUX_##N##_DYN_ON          /* the others reuse the DYN token   */
 #define GATE_BUS(N)  BUS_##N##_DYN_ON          /* (it is never used, see HAS_GATE) */
 #define GATE_MAIN(N) MAIN_##N##_DYN_ON
 #define GATE_MTX(N)  MTX_##N##_DYN_ON
+#define LINK_CH(N)   CH_##N##_CLINK            /* same idea for the source link:   */
+#define LINK_AUX(N)  AUX_##N##_CLINK           /* only CH and AUX have it          */
+#define LINK_BUS(N)  BUS_##N##_DYN_ON
+#define LINK_MAIN(N) MAIN_##N##_DYN_ON
+#define LINK_MTX(N)  MTX_##N##_DYN_ON
 
 /* Check that strip L of family P sits where the stride of strips 1 and 2 says. */
 #define CHECK_FIELD(P, L, F) \
@@ -93,6 +103,8 @@ CHECK_FAMILY(BUS, 16);
 CHECK_FAMILY(MAIN, 4);
 CHECK_FAMILY(MTX, 8);
 CHECK_FIELD(CH, 40, GATE_ON);
+CHECK_FIELD(CH, 40, CLINK);
+CHECK_FIELD(AUX, 8, CLINK);
 
 static Source SRC[NSRC];
 
@@ -124,21 +136,29 @@ typedef struct {
 	const char *label;
 	int base, count;
 } Bank;
-#define NBANK 9
-static const Bank BANKS[NBANK] = { { "CH 1-12", 0, 12 }, { "CH 13-24", 12, 12 },
-		{ "CH 25-36", 24, 12 }, { "CH 37-40", 36, 4 }, { "AUX 1-8", 40, 8 }, {
-				"BUS 1-8", 48, 8 }, { "BUS 9-16", 56, 8 },
+#define NBANK 13
+static const Bank BANKS[NBANK] = {
+		{ "CH 1-12", 0, 12 }, { "CH 13-24", 12, 12 }, { "CH 25-36", 24, 12 },
+		{ "CH 37-40", 36, 4 },
+		{ "CH 1-16", 0, 16 }, { "CH 17-32", 16, 16 }, { "CH 33-40", 32, 8 },
+		{ "AUX 1-8", 40, 8 },
+		{ "BUS 1-8", 48, 8 }, { "BUS 9-16", 56, 8 }, { "BUS 1-16", 48, 16 },
 		{ "MAIN 1-4", 64, 4 }, { "MTX 1-8", 68, 8 }, };
-
-#define NSTRIP 12
+#define NSTRIP 16 /* most strips shown at once (4 groups of 4) */
 #define GROUP  4
 
 /* ---- layout (pixels) ----------------------------------------------------- */
 #define STRIP_W      90
-#define GROUP_GAP    18
+#define GROUP_GAP    9 
 #define MARGIN       14
 #define BTN_X        8
 #define BTN_W        (STRIP_W - 2 * BTN_X)
+#define WPANEL_VERSION "0.1.0"
+#define WPANEL_TITLE   "wpanel - (c) 2026 - Patrick-Gilles Maillot - v " WPANEL_VERSION
+
+#define LOCK_X       70           /* padlock on the scribble strip: offset from the strip x */
+#define LOCK_W       10
+#define LOCK_H       13
 #define Y_SCRIB      58
 #define H_SCRIB      60
 #define Y_SEL        126
@@ -152,13 +172,16 @@ static const Bank BANKS[NBANK] = { { "CH 1-12", 0, 12 }, { "CH 13-24", 12, 12 },
 #define Y_FDR_BOT    596          /* handle centre at -oo                     */
 #define Y_READ       624
 #define H_READ       24
-#define Y_STATUS     660
+#define Y_STATUS     (Y_READ + H_READ + 8)
 #define STRIP_TOP    (Y_SCRIB - 6)
 #define STRIP_BOT    (Y_READ + H_READ + 4)
 
 #define BANK_W       84           /* width of the vertical bank buttons at the left */
 #define STRIP_X0     (MARGIN + BANK_W + 14)   /* x of the first strip */
-#define MIN_CLIENT_W 640          /* keeps the status line readable with few strips */
+#define MIN_CLIENT_W 454          /* the top bar (IP, Find, Connect, Meters) must fit */
+#define RIGHT_PAD    MARGIN       /* space right of the last strip's buttons: same as the left margin */
+#define STATUS_H     18           /* status line: one line */
+#define BOTTOM_PAD   6            /* space below the status line */
 
 enum {
 	ID_IP = 101,
@@ -222,7 +245,7 @@ static int g_connected = 0;
 
 static int g_bank = 0; /* current bank                 */
 static int g_base = 0; /* source shown on strip 0      */
-static int g_nvis = NSTRIP; /* strips in use in this bank   */
+static int g_nvis = 12; /* strips in use in this bank   */
 
 /* per-strip values (indexed by strip 0..11, not by source) */
 static int g_mute[NSTRIP], g_solo[NSTRIP], g_col[NSTRIP]; /* -1 = unknown */
@@ -233,6 +256,7 @@ static int g_name_dirty[NSTRIP]; /* re-read this name from the console */
 
 /* meters (per strip) */
 #define NO_LEVEL (-128.0f)
+static int g_link[NSTRIP]; /* link to source: -1 unknown, else the clink value */
 static int g_dyn_on[NSTRIP], g_gate_on[NSTRIP]; /* processor enabled: -1 unknown, 0, 1 */
 static int g_gate_eng[NSTRIP], g_dyn_eng[NSTRIP]; /* engaged (gating / reducing) now */
 static int g_meter_post; /* 0 = PRE fader (input), 1 = POST (output) */
@@ -278,16 +302,16 @@ static int strip_x(int i) {
 
 /* Client width needed for n strips (at least MIN_CLIENT_W). */
 static int client_width(int n) {
-	int groups = (n + GROUP - 1) / GROUP;
-	int w = STRIP_X0 + n * STRIP_W + (groups > 1 ? groups - 1 : 0) * GROUP_GAP + MARGIN;
+	/* right edge of the last strip's buttons, plus a small right margin */
+	int w = strip_x(n > 0 ? n - 1 : 0) + BTN_X + BTN_W + RIGHT_PAD;
 	return w < MIN_CLIENT_W ? MIN_CLIENT_W : w;
 }
 
 /* y of bank button k: a small gap between CH / AUX / BUS / MAIN / MTX families */
 static int bank_y(int k) {
-	static const int fam[4] = { 4, 5, 7, 8 };
+	static const int fam[5] = { 4, 7, 8, 11, 12 }; /* first button of each group of banks */
 	int j, y = Y_SCRIB + k * 32;
-	for (j = 0; j < 4; j++)
+	for (j = 0; j < 5; j++)
 		if (k >= fam[j])
 			y += 10;
 	return y;
@@ -297,11 +321,11 @@ static int bank_y(int k) {
 static void apply_layout(void) {
 	DWORD style = (DWORD) GetWindowLong(g_wnd, GWL_STYLE);
 	int cw = client_width(g_nvis);
-	RECT rc = { 0, 0, cw, Y_STATUS + 24 + MARGIN };
+	RECT rc = { 0, 0, cw, Y_STATUS + STATUS_H + BOTTOM_PAD };
 	AdjustWindowRect(&rc, style, FALSE);
 	SetWindowPos(g_wnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
 	SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-	SetWindowPos(g_status, NULL, 0, 0, cw - 2 * MARGIN, 24, SWP_NOMOVE | SWP_NOZORDER);
+	SetWindowPos(g_status, NULL, 0, 0, cw - 2 * MARGIN, STATUS_H, SWP_NOMOVE | SWP_NOZORDER);
 	InvalidateRect(g_wnd, NULL, FALSE);
 }
 
@@ -354,13 +378,13 @@ static void update_sel_label(void) {
 	int vis = g_sel - g_base;
 
 	if (!g_connected || g_sel < 0) {
-		SetWindowTextA(g_sellbl, "Selected: --");
+		SetWindowTextA(g_sellbl, "Selected:\r\n--");
 		return;
 	}
 	index_label(g_sel, lbl, sizeof lbl);
 	name = (vis >= 0 && vis < g_nvis) ? g_name[vis] : g_selname;
-	if (name[0]) snprintf(text, sizeof text, "Selected: %s (%s)", lbl, name);
-	else         snprintf(text, sizeof text, "Selected: %s", lbl);
+	if (name[0]) snprintf(text, sizeof text, "Selected:\r\n%s (%s)", lbl, name);
+	else         snprintf(text, sizeof text, "Selected:\r\n%s", lbl);
 	SetWindowTextA(g_sellbl, text);
 }
 
@@ -386,6 +410,12 @@ static void set_dyn_on(int i, int v) {
 static void set_gate_on(int i, int v) {
 	if (g_gate_on[i] != v) {
 		g_gate_on[i] = v;
+		invalidate_strip(i);
+	}
+}
+static void set_link(int i, int v) {
+	if (g_link[i] != v) {
+		g_link[i] = v;
 		invalidate_strip(i);
 	}
 }
@@ -455,6 +485,7 @@ static void reset_strips(void) {
 		g_gate_gr[i] = g_dyn_gr[i] = 0.0f;
 		g_gate_eng[i] = g_dyn_eng[i] = 0;
 		g_dyn_on[i] = g_gate_on[i] = -1;
+		g_link[i] = -1;
 	}
 }
 
@@ -514,6 +545,8 @@ static void read_all(int with_names) {
 		if (wGetTokenIntTimed(TOK(i).dyn_on, &v, RESYNC_WAIT_US) > 0) set_dyn_on(i, v ? 1 : 0);
 		if (HAS_GATE(g_base + i) && wGetTokenIntTimed(TOK(i).gate_on, &v, RESYNC_WAIT_US) > 0)
 		set_gate_on(i, v ? 1 : 0);
+		if (HAS_LINK(g_base + i) && wGetTokenIntTimed(TOK(i).clink, &v, RESYNC_WAIT_US) > 0)
+			set_link(i, v ? 1 : 0);
 		if (with_names) {
 			buf[0] = '\0';
 			if (wGetTokenStringTimed(TOK(i).name, buf, RESYNC_WAIT_US) > 0) {
@@ -541,7 +574,7 @@ static void refresh_name(int i) {
  * the first WING that answers and writes that console's IP address into the
  * buffer we give it (so the buffer must be big enough for an address). */
 static void do_connect(void) {
-	char ip[64]; /* receives the IP when searching */
+	char ip[24]; /* receives the IP when searching (an IPv4 address needs 16 bytes at most) */
 	int searching, rc;
 
 	if (g_connected) {
@@ -553,15 +586,15 @@ static void do_connect(void) {
 	GetWindowTextA(g_ip, ip, sizeof ip);
 	searching = (ip[0] == '\0');
 	set_status( searching ?
-					"Searching for a WING on the local network..." :
+					"Searching for a WING on the network..." :
 					"Connecting...");
 	UpdateWindow(g_status);
 
 	rc = wOpen(ip);
 	if (!WOPEN_SUCCEEDED(rc)) {
 		set_status( searching ?
-						"No WING found on the local network. Type its IP address instead." :
-						"Could not connect. Check the IP address and network.");
+						"No WING found. Type its IP address." :
+						"Could not connect. Check IP and network.");
 		return;
 	}
 	if (searching)
@@ -570,8 +603,7 @@ static void do_connect(void) {
 	SetWindowTextA(g_connect, "Disconnect");
 	read_all(1);
 	update_sel_label();
-	set_status(
-			"Connected. Drag faders, click the buttons, double-click a name to rename.");
+	set_status("Connected.");
 	start_meters(); /* may replace the status if meters fail */
 	g_last_sync = GetTickCount();
 	SetTimer(g_wnd, ID_TIMER, TICK_MS, NULL);
@@ -616,8 +648,13 @@ static void start_meters(void) {
 	if (!g_connected) return;
 
 	if (!g_meter_port_ok) { /* UDP port the console sends meters to */
-		for (p = METER_PORT; p < METER_PORT + 20 && !g_meter_port_ok; p++)
+		/* Start at a port that depends on the process, so two instances do not
+		 * compete for the same one; then try the following ports until one is free. */
+		int first = METER_PORT + (int) (GetCurrentProcessId() % METER_PORTS);
+		for (i = 0; i < METER_PORTS && !g_meter_port_ok; i++) {
+			p = METER_PORT + (first - METER_PORT + i) % METER_PORTS;
 			if (wMeterUDPPort(p) > 0) g_meter_port_ok = 1;
+		}
 		if (!g_meter_port_ok) {
 			set_status("Meters unavailable: no free UDP port.");
 			return;
@@ -629,7 +666,9 @@ static void start_meters(void) {
 		s = meter_bit(g_base + i);
 		mb[s >> 3] |= (unsigned char) (0x80 >> (s & 7));
 	}
-	g_meter_id++; /* new id, so data of an old request is ignored */
+	/* A new id for each request, so data of an old request is ignored. The id also
+	 * carries the process id: two instances never use the same report id. */
+	g_meter_id = (int) (((GetCurrentProcessId() & 0x7FFF) << 16) | (((unsigned) g_meter_id + 1) & 0xFFFF));
 	if (wSetMetersRequest(g_meter_id, mb) > 0) {
 		g_meter_ok = 1;
 		g_meter_renew = GetTickCount();
@@ -738,6 +777,7 @@ static void handle_event(const wTV *e) {
 		else if (e->token == TOK(i).col) {set_col(i, ev_int(e)); return;}
 		else if (e->token == TOK(i).dyn_on) {set_dyn_on(i, ev_int(e) ? 1 : 0); return;}
 		else if (HAS_GATE(g_base + i) && e->token == TOK(i).gate_on) {set_gate_on(i, ev_int(e) ? 1 : 0); return;}
+		else if (HAS_LINK(g_base + i) && e->token == TOK(i).clink) {set_link(i, ev_int(e) ? 1 : 0); g_name_dirty[i] = 1; return;}
 		else if (e->token == TOK(i).fdr) {if (i != g_drag) set_fdr(i, ev_float(e)); return;}
 		else if (e->token == TOK(i).name) {
 			/* The event itself is the truth: a string event with no text (NULL or "")
@@ -822,6 +862,15 @@ static void toggle_gate(int i) {
 	set_gate_on(i, on);
 }
 
+/* Toggle "link to source". The name shown may change with it, so re-read it. */
+static void toggle_link(int i) {
+	int clink = (g_link[i] == 1) ? 0 : 1;
+	if (!HAS_LINK(g_base + i) || g_link[i] < 0) return;
+	wSetTokenInt(TOK(i).clink, clink);
+	set_link(i, clink);
+	g_name_dirty[i] = 1;
+}
+
 static void toggle_solo(int i) {
 	int on = (g_solo[i] == 1) ? 0 : 1;
 	wSetTokenInt(TOK(i).solo, on);
@@ -895,28 +944,19 @@ static void finish_edit(void) {
 	DestroyWindow(e);
 
 	if (g_edit_commit && g_connected && i >= 0 && i < g_nvis) {
-		char back[256], msg[160], lbl[16];
-		int rc, ok;
+		char back[256];
+		int rc;
 
-		src_label(g_base + i, lbl, sizeof lbl);
 		buf[16] = '\0'; /* WING names: 16 characters max */
 		rc = wSetTokenString(TOK(i).name, buf);
 		set_name(i, buf); /* instant feedback */
 
-		/* Read the name back so the strip shows what the console really holds,
-		 * and tell the user if the console did not take it. */
+		/* Read the name back, so the strip shows what the console really holds. */
 		back[0] = '\0';
-		ok = rc > 0 && wGetTokenStringTimed(TOK(i).name, back, RESYNC_WAIT_US) > 0;
-		if (ok) back[sizeof back - 1] = '\0';
-		if (ok && strcmp(back, buf) == 0) {
-			snprintf(msg, sizeof msg, "%s renamed to \"%s\".", lbl, buf);
-		} else if (ok) {
+		if (rc > 0 && wGetTokenStringTimed(TOK(i).name, back, RESYNC_WAIT_US) > 0) {
+			back[sizeof back - 1] = '\0';
 			set_name(i, back);
-			snprintf(msg, sizeof msg, "%s: console kept the name \"%s\".", lbl, back);
-		} else {
-			snprintf(msg, sizeof msg, "%s rename was not confirmed (wapi code %d).", lbl, rc);
 		}
-		set_status(msg);
 	}
 }
 
@@ -939,7 +979,7 @@ static void start_edit(int i) {
 
 /* ---- mouse hit-testing --------------------------------------------------- */
 enum {
-	Z_NONE, Z_SCRIB, Z_SEL, Z_SOLO, Z_MUTE, Z_FDR, Z_DYN, Z_GATE
+	Z_NONE, Z_SCRIB, Z_SEL, Z_SOLO, Z_MUTE, Z_FDR, Z_DYN, Z_GATE, Z_LINK
 };
 
 static int hit(int x, int y, int *zone) {
@@ -949,14 +989,16 @@ static int hit(int x, int y, int *zone) {
 		int sx = strip_x(i), bx = sx + BTN_X;
 		if (x < sx || x >= sx + STRIP_W)
 			continue;
-		if (y >= Y_SCRIB && y < Y_SCRIB + H_SCRIB)                                *zone = Z_SCRIB;
+		if (HAS_LINK(g_base + i) && x >= sx + LOCK_X - 3 && x < sx + LOCK_X + LOCK_W + 3
+				&& y >= Y_SCRIB && y < Y_SCRIB + LOCK_H + 8)                      *zone = Z_LINK;
+		else if (y >= Y_SCRIB && y < Y_SCRIB + H_SCRIB)                           *zone = Z_SCRIB;
 		else if (x >= bx && x < bx + BTN_W && y >= Y_SEL && y < Y_SEL + H_BTN)    *zone = Z_SEL;
 		else if (x >= bx && x < bx + BTN_W && y >= Y_SOLO && y < Y_SOLO + H_BTN)  *zone = Z_SOLO;
 		else if (x >= bx && x < bx + BTN_W && y >= Y_MUTE && y < Y_MUTE + H_MUTE) *zone = Z_MUTE;
 		else if (x >= bx && x < bx + 30 && y >= Y_METER + 2 && y < Y_METER + 16)  *zone = Z_DYN;
 		else if (x >= bx&& x < bx + 30 && y >= Y_METER + 80 && y < Y_METER + 94 && HAS_GATE(g_base + i))
 			*zone = Z_GATE;
-		else if (x >= sx + 8 && x < sx + 50 && y >= Y_FDR_TOP - 18
+		else if (x >= sx + 11 && x < sx + 51 && y >= Y_FDR_TOP - 18
 				&& y <= Y_FDR_BOT + 18)
 			*zone = Z_FDR;
 		return i;
@@ -1013,7 +1055,8 @@ static void dblclick(int x, int y) {
 	if (!g_connected)      return;
 	i = hit(x, y, &zone);
 	if (i < 0) return;
-	if (zone == Z_SCRIB)    start_edit(i);
+	if (zone == Z_LINK)     toggle_link(i);   /* a single click does nothing here */
+	else if (zone == Z_SCRIB) start_edit(i);
 	else if (zone == Z_FDR) send_fader(i, 0.0);
 	else                    click(x, y); /* fast double-tap on a button */
 }
@@ -1137,8 +1180,17 @@ static void draw_meter(HDC dc, int i, int x) {
 	gr_row(dc, x, Y_METER + 80, "GATE", g_gate_gr[i], 20.0f, g_gate_eng[i], g_gate_on[i], HAS_GATE(g_base + i));
 }
 
+/* Small padlock: closed = linked to the source, open = custom (not linked). */
+static void draw_lock(HDC dc, int x, int y, int linked, COLORREF c) {
+	fill_rect(dc, x, y + 6, LOCK_W, 7, c);               /* body */
+	fill_rect(dc, x + 2, y, 6, 2, c);                    /* shackle: top bar */
+	fill_rect(dc, x + 2, y, 2, 6, c);                    /*          left post */
+	if (linked) fill_rect(dc, x + 6, y, 2, 6, c);        /* closed: right post reaches the body */
+	else        fill_rect(dc, x + 6, y, 2, 2, c);        /* open: right post is lifted */
+}
+
 static void draw_strip(HDC dc, int i) {
-	int sx = strip_x(i), bx = sx + BTN_X, tx = sx + 28, k, y;
+	int sx = strip_x(i), bx = sx + BTN_X, tx = sx + 30, k, y;
 	int sel = (g_sel == g_base + i);
 	COLORREF sc = (g_col[i] >= 1 && g_col[i] <= NCOLORS) ? WCOL[g_col[i]] : WCOL[0];
 	COLORREF mc = g_mute[i] == 1 ? C_MUTED : g_mute[i] == 0 ? C_LIVE : C_UNKNOWN;
@@ -1155,6 +1207,9 @@ static void draw_strip(HDC dc, int i) {
 	text(dc, g_font, tc, sx + 6, Y_SCRIB + 24, STRIP_W - 12, 32,
 	DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS, g_name[i]);
 
+	if (HAS_LINK(g_base + i) && g_link[i] >= 0)
+		draw_lock(dc, sx + LOCK_X, Y_SCRIB + 4, g_link[i] == CLINK_LINKED, tc);
+
 	/* SELECT / SOLO / MUTE */
 	button(dc, bx, Y_SEL, BTN_W, H_BTN, sel ? C_SELECT : C_DARK, sel ? RGB(0, 0, 0) : RGB(255, 255, 255), "SELECT");
 	button(dc, bx, Y_SOLO, BTN_W, H_BTN, g_solo[i] == 1 ? C_SOLO : C_DARK, g_solo[i] == 1 ? RGB(0, 0, 0) : RGB(255, 255, 255), "SOLO");
@@ -1165,18 +1220,18 @@ static void draw_strip(HDC dc, int i) {
 	fill_rect(dc, tx - 2, Y_FDR_TOP - 6, 4, Y_FDR_BOT - Y_FDR_TOP + 12, RGB(0, 0, 0));
 	for (k = 0; k < (int) (sizeof SCALE_LABELS / sizeof SCALE_LABELS[0]); k++) {
 		y = fader_y(fader_t(SCALE_LABELS[k]));
-		fill_rect(dc, sx + 46, y, 6, 1, RGB(40, 40, 40));
+		fill_rect(dc, sx + 49, y, 5, 1, RGB(40, 40, 40));
 		snprintf(buf, sizeof buf, "%d", SCALE_LABELS[k]);
-		text(dc, g_small, RGB(30, 30, 30), sx + 54, y - 8, 34, 16, DT_LEFT | DT_VCENTER, buf);
+		text(dc, g_small, RGB(30, 30, 30), sx + 55, y - 8, 22, 16, DT_RIGHT | DT_VCENTER, buf);
 	}
-	fill_rect(dc, sx + 46, Y_FDR_BOT, 6, 1, RGB(40, 40, 40));
+	fill_rect(dc, sx + 49, Y_FDR_BOT, 5, 1, RGB(40, 40, 40));
 	{
 		static const WCHAR inf[] = { '-', 0x221E, 0 };
-		RECT r = { sx + 54, Y_FDR_BOT - 8, sx + 88, Y_FDR_BOT + 8 };
+		RECT r = { sx + 55, Y_FDR_BOT - 8, sx + 77, Y_FDR_BOT + 8 };
 		HGDIOBJ old = SelectObject(dc, g_small);
 		SetBkMode(dc, TRANSPARENT);
 		SetTextColor(dc, RGB(30, 30, 30));
-		DrawTextW(dc, inf, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+		DrawTextW(dc, inf, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 		SelectObject(dc, old);
 	}
 
@@ -1226,6 +1281,9 @@ static void paint(HWND hwnd) {
 	meters_only = (pr.top >= Y_METER && pr.bottom <= Y_METER + H_METER);
 
 	fill_rect(mem, pr.left, pr.top, w, h, C_BG);
+	/* vertical line between the bank buttons and the first group of strips */
+	fill_rect(mem, (MARGIN + BANK_W + STRIP_X0 + 4) / 2 - 1, STRIP_TOP, 2,
+	STRIP_BOT - STRIP_TOP, RGB(120, 118, 112));
 	for (i = 1; i * GROUP < g_nvis; i++) /* group dividers */
 		fill_rect(mem, strip_x(i * GROUP) - GROUP_GAP / 2 - 1, STRIP_TOP, 2,
 		STRIP_BOT - STRIP_TOP, RGB(120, 118, 112));
@@ -1274,14 +1332,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 		make("STATIC", "WING IP:", 0, MARGIN, 16, 66, 24, hwnd, 0);
 		g_ip = make("EDIT", "", WS_BORDER | ES_AUTOHSCROLL,
-		MARGIN + 70, 12, 140, 28, hwnd, ID_IP);
+		MARGIN + 70, 12, 120, 28, hwnd, ID_IP);
 		g_find = make("BUTTON", "Find", BS_PUSHBUTTON,
-		MARGIN + 216, 12, 54, 28, hwnd, ID_FIND);
+		MARGIN + 194, 12, 48, 28, hwnd, ID_FIND);
 		g_connect = make("BUTTON", "Connect", BS_PUSHBUTTON,
-		MARGIN + 276, 12, 96, 28, hwnd, ID_CONNECT);
+		MARGIN + 246, 12, 80, 28, hwnd, ID_CONNECT);
 
 		g_metermode = make("BUTTON", "Meters: PRE", BS_PUSHBUTTON,
-		MARGIN + 380, 12, 110, 28, hwnd, ID_METERMODE);
+		MARGIN + 330, 12, 98, 28, hwnd, ID_METERMODE);
 
 		for (k = 0; k < NBANK; k++)
 			g_bankbtn[k] = make("BUTTON", BANKS[k].label,
@@ -1289,11 +1347,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			MARGIN, bank_y(k), BANK_W, 28, hwnd, ID_BANK0 + k);
 		SendMessage(g_bankbtn[0], BM_SETCHECK, BST_CHECKED, 0);
 
-		g_sellbl = make("STATIC", "Selected: --", 0,
+		g_sellbl = make("STATIC", "Selected:\r\n--", 0,
 		MARGIN, bank_y(NBANK - 1) + 44, BANK_W, 110, hwnd, ID_SELLBL);
 		SendMessage(g_sellbl, WM_SETFONT, (WPARAM) g_font, TRUE);
 		g_status = make("STATIC", "Not connected", 0,
-		MARGIN, Y_STATUS, 680, 24, hwnd, ID_STATUS);
+		MARGIN, Y_STATUS, 680, STATUS_H, hwnd, ID_STATUS);
 		return 0;
 
 	case WM_ERASEBKGND:
@@ -1376,8 +1434,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
 	init_sources();
 	WNDCLASSA wc = { 0 };
 	DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-	int client_w = client_width(NSTRIP);
-	int client_h = Y_STATUS + 24 + MARGIN;
+	int client_w = client_width(12);
+	int client_h = Y_STATUS + STATUS_H + BOTTOM_PAD;
 	RECT rc = { 0, 0, client_w, client_h };
 	HWND hwnd;
 	MSG m;
@@ -1390,12 +1448,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
 	wc.lpfnWndProc = wndproc;
 	wc.hInstance = inst;
 	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-	wc.lpszClassName = "WingPanelWnd";
+	wc.lpszClassName = "wpanelWnd";
 	RegisterClassA(&wc);
 
 	FreeConsole();
 
-	hwnd = CreateWindowExA(0, wc.lpszClassName, "WingPanel", style, CW_USEDEFAULT, CW_USEDEFAULT,
+	hwnd = CreateWindowExA(0, wc.lpszClassName, WPANEL_TITLE, style, CW_USEDEFAULT, CW_USEDEFAULT,
 			rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, inst, NULL);
 	apply_layout();
 	ShowWindow(hwnd, show);
