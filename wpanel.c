@@ -42,6 +42,8 @@
  *          Added a Clear Solo button
  *          Added coloring scheme to buttons
  *          Added scribble lighting OFF state (LED = 0) and adapted the color based on the C-LINK state
+ * v 0.1.3: Parameters tweaking
+ *          DCA button/panel added
  */
 #include <math.h>
 #include <windows.h>
@@ -54,11 +56,12 @@
 #include "../wapi/wext.h"
 
 /* ---- configuration ------------------------------------------------------ */
+#define EPSIL          0.001     /* epsilon value for float comparisons      */
 #define TICK_MS        25        /* event loop period                        */
-#define EVENT_WAIT_US  1000      /* max time one tick waits for events (µs)  */
+#define EVENT_WAIT_US  500       /* max time one tick waits for events (µs)  */
 #define MAX_EVENTS     512       /* wapi events buffer size                  */
 #define RESYNC_MS      5000      /* full re-read of every visible value      */
-#define RESYNC_WAIT_US 50000     /* per-token wait during a resync (µs)      */
+#define RESYNC_WAIT_US 25000     /* per-token wait during a resync (µs)      */
 #define S_STRINGS      24        /* size of strings arrays                   */
 
 /* meters (wapi metering API) */
@@ -81,14 +84,18 @@
 typedef struct {
 	wtoken mute, solo, name, col, fdr, dname, dyn_on, gate_on, clink, led, dcol;
 } Source;
-#define NSRC 76
+#define NSRC 92
 static Source SRC[NSRC];
+#define HAS_DYN(s)  ((s) < 76)       /* DCAs (76..91) have no dynamics, nor meters, nor $name/$col */
 #define HAS_GATE(s) ((s) < 40)       /* only the input channels have a gate */
 #define HAS_LINK(s) ((s) < 48)       /* "link to source" exists on channels and aux only */
 #define CLINK_LINKED 1               /* value of the clink token when linked to the source
                                       * (clink = "custom link"; with the value below the
                                       * padlock is drawn closed) */
-/* The tokens of each source family (CH, AUX, BUS, MAIN, MTX) are laid out at a
+
+/* wapi token definitions:
+ *
+ * The tokens of each source family (CH, AUX, BUS, MAIN, MTX) are laid out at a
  * constant distance in wapi.h's enum: CH_2_MUTE - CH_1_MUTE is the same for every
  * channel and for every field. So each family is described by its first two
  * strips, and the table is filled in with a loop at start-up. The static asserts
@@ -97,6 +104,11 @@ static Source SRC[NSRC];
 
 #define FIELDS(P, N) {P##_##N##_MUTE, P##_##N##_$SOLO, P##_##N##_NAME, P##_##N##_COL, \
                       P##_##N##_FDR,  P##_##N##_$NAME, P##_##N##_DYN_ON, GATE_##P(N), LINK_##P(N), P##_##N##_LED, P##_##N##_$COL}
+/* DCA: no $name, $col, dyn, gate or link tokens. Name and colour are read from
+ * their own tokens; the unused dyn_on, gate_on and clink slots are 0 (never used,
+ * see HAS_DYN, HAS_GATE and HAS_LINK) */
+#define FIELDS_DCA(P, N) {DCA_##N##_MUTE, DCA_##N##_$SOLO, DCA_##N##_NAME, DCA_##N##_COL, \
+                       DCA_##N##_FDR,  DCA_##N##_NAME, 0, 0, 0, DCA_##N##_LED, DCA_##N##_COL}
 #define GATE_CH(N)     CH_##N##_GATE_ON         /* only input channels have a gate; */
 #define GATE_AUX(N)   AUX_##N##_DYN_ON          /* the others reuse the DYN token   */
 #define GATE_BUS(N)   BUS_##N##_DYN_ON          /* (it is never used, see HAS_GATE) */
@@ -107,25 +119,6 @@ static Source SRC[NSRC];
 #define LINK_BUS(N)   BUS_##N##_DYN_ON
 #define LINK_MAIN(N) MAIN_##N##_DYN_ON
 #define LINK_MTX(N)   MTX_##N##_DYN_ON
-
-/* Check that strip L of family P sits where the stride of strips 1 and 2 says. */
-#define CHECK_FIELD(P, L, F) \
-    _Static_assert((int)P##_##L##_##F == (int)P##_1_##F + ((L) - 1) * \
-                  ((int)P##_2_##F - (int)P##_1_##F), #P " tokens are not evenly spaced in wapi.h")
-#define CHECK_FAMILY(P, L) \
-    CHECK_FIELD(P, L, MUTE); CHECK_FIELD(P, L, $SOLO); CHECK_FIELD(P, L, NAME); \
-    CHECK_FIELD(P, L, COL);  CHECK_FIELD(P, L, FDR);   CHECK_FIELD(P, L, $NAME); \
-    CHECK_FIELD(P, L, DYN_ON); CHECK_FIELD(P, L, LED); CHECK_FIELD(P, L, $COL)
-
-CHECK_FAMILY(CH, 40);
-CHECK_FAMILY(AUX, 8);
-CHECK_FAMILY(BUS, 16);
-CHECK_FAMILY(MAIN, 4);
-CHECK_FAMILY(MTX, 8);
-CHECK_FIELD(CH, 40, GATE_ON);
-CHECK_FIELD(CH, 40, CLINK);
-CHECK_FIELD(AUX, 8, CLINK);
-
 
 /* Fill SRC[first .. first+count-1] from the first two strips of a family. */
 static void add_family(int first, int count, Source a, Source b) {
@@ -140,13 +133,14 @@ static void add_family(int first, int count, Source a, Source b) {
 }
 
 static void init_sources(void) {
-#define FAMILY(P, FIRST, COUNT) \
-    add_family(FIRST, COUNT, (Source)FIELDS(P, 1), (Source)FIELDS(P, 2))
-	FAMILY(CH, 0, 40);   /* source 0..39  = CH 1..40  */
-	FAMILY(AUX, 40, 8);  /*        40..47 = AUX 1..8  */
-	FAMILY(BUS, 48, 16); /*        48..63 = BUS 1..16 */
-	FAMILY(MAIN, 64, 4); /*        64..67 = MAIN 1..4 */
-	FAMILY(MTX, 68, 8);  /*        68..75 = MTX 1..8  */
+#define FAMILY(F, P, FIRST, COUNT) /* F = fields macro of the family, P = its prefix */ \
+    add_family(FIRST, COUNT, (Source)F(P, 1), (Source)F(P, 2))
+	FAMILY(FIELDS, CH, 0, 40);     /* source 0..39  = CH 1..40  */
+	FAMILY(FIELDS, AUX, 40, 8);    /*        40..47 = AUX 1..8  */
+	FAMILY(FIELDS, BUS, 48, 16);   /*        48..63 = BUS 1..16 */
+	FAMILY(FIELDS, MAIN, 64, 4);   /*        64..67 = MAIN 1..4 */
+	FAMILY(FIELDS, MTX, 68, 8);    /*        68..75 = MTX 1..8  */
+	FAMILY(FIELDS_DCA, DCA, 76, 16); /*      76..91 = DCA 1..16 */
 #undef FAMILY
 }
 
@@ -161,7 +155,7 @@ static const Bank BANKS[] = {
 		{"CH 1-16", 0, 16}, {"CH 17-32", 16, 16}, {"CH 33-40", 32, 8},
 		{"AUX 1-8", 40, 8},
 		{"BUS 1-8", 48, 8}, {"BUS 9-16", 56, 8}, {"BUS 1-16", 48, 16},
-		{"MAIN 1-4", 64, 4}, {"MTX 1-8", 68, 8},};
+		{"MAIN 1-4", 64, 4}, {"MTX 1-8", 68, 8}, {"DCA 1-16", 76, 16},};
 #define NBANK ((int)(sizeof(BANKS) / sizeof(Bank)))
 
 #define GROUP  4
@@ -337,9 +331,9 @@ static int client_width(int n) {
 
 /* y of bank button k: a small gap between CH / AUX / BUS / MAIN / MTX families */
 static int bank_y(int k) {
-	static const int fam[5] = {4, 7, 8, 11, 12}; /* first button of each group of banks */
+	static const int fam[6] = {4, 7, 8, 11, 12, 13}; /* first button of each group of banks */
 	int j, y = Y_SCRIB + k * (H_BTN + S_BTN);
-	for (j = 0; j < 5; j++)
+	for (j = 0; j < 6; j++)
 		if (k >= fam[j])
 			y += F_BTN;
 	return y;
@@ -387,7 +381,8 @@ static void src_label(int s, char *out, size_t n) {
 	else if (s < 48) snprintf(out, n, "A%d", s - 39);
 	else if (s < 64) snprintf(out, n, "B%d", s - 47);
 	else if (s < 68) snprintf(out, n, "M%d", s - 63);
-	else             snprintf(out, n, "MX%d", s - 67);
+	else if (s < 76) snprintf(out, n, "MX%d", s - 67);
+	else             snprintf(out, n, "DCA%d", s - 75);
 }
 
 /* Console strip index (0..75) -> text such as "CH 5", "AUX 2", "BUS 3". */
@@ -461,7 +456,7 @@ static void set_col(int i, int v) {
 }
 
 static void set_fdr(int i, float v) {
-	if (g_fdr_ok[i] && g_fdr[i] == v) return;
+	if (g_fdr_ok[i] && ((g_fdr[i] < v + EPSIL) && (g_fdr[i] > v - EPSIL))) return;
 	g_fdr[i] = v;
 	g_fdr_ok[i] = 1;
 	invalidate_strip(i);
@@ -564,39 +559,40 @@ static void disconnect(const char *why) {
 
 /* Read every value of the visible strips from the console. The wapi getters
  * return WSUCCESS (1) when the value was read, so a timeout or error (0 or
- * negative) leaves the displayed value alone. Stops at the first token that
- * doesn't answer, so an unresponsive console can't freeze the window for long. */
-static void read_all(int with_names) {
+ * negative) leaves the displayed value alone. Stops at the first or second token
+ * that doesn't answer, so an unresponsive console can't freeze the window for long. */
+static void read_all(void) {
 	int i, v;
 	float f;
-	char buf[256];
+	char buf[S_STRINGS];
 
 	for (i = 0; i < g_nvis; i++) {
-		if (wGetTokenIntTimed(TOK(i).mute, &v, RESYNC_WAIT_US) != WSUCCESS || (v != 0 && v != 1)) return;
+		if (wGetTokenIntTimed(TOK(i).mute, &v, RESYNC_WAIT_US) != WSUCCESS)
+			if (wGetTokenIntTimed(TOK(i).mute, &v, RESYNC_WAIT_US) != WSUCCESS) return;
 		set_mute(i, v);
-		if (wGetTokenIntTimed(TOK(i).solo, &v, RESYNC_WAIT_US) != WSUCCESS) return;
+		if (wGetTokenIntTimed(TOK(i).solo, &v, RESYNC_WAIT_US) != WSUCCESS)
+			if (wGetTokenIntTimed(TOK(i).solo, &v, RESYNC_WAIT_US) != WSUCCESS)return;
 		set_solo(i, v ? 1 : 0);
-		if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) != WSUCCESS) return;
+		if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) != WSUCCESS)
+			if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) != WSUCCESS) return;
 		set_col(i, v);
 		if (wGetTokenIntTimed(TOK(i).led, &v, RESYNC_WAIT_US) == WSUCCESS) set_led(i, v ? 1 : 0);
-		if (wGetTokenFloatTimed(TOK(i).fdr, &f, RESYNC_WAIT_US) != WSUCCESS) return;
+		if (wGetTokenFloatTimed(TOK(i).fdr, &f, RESYNC_WAIT_US) != WSUCCESS)
+			if (wGetTokenFloatTimed(TOK(i).fdr, &f, RESYNC_WAIT_US) != WSUCCESS) return;
 		if (i != g_drag) set_fdr(i, f); /* don't fight the mouse */
-		if (wGetTokenIntTimed(TOK(i).dyn_on, &v, RESYNC_WAIT_US) == WSUCCESS) set_dyn_on(i, v ? 1 : 0);
+		if (HAS_DYN(g_base + i) && wGetTokenIntTimed(TOK(i).dyn_on, &v, RESYNC_WAIT_US) == WSUCCESS) set_dyn_on(i, v ? 1 : 0);
 		if (HAS_GATE(g_base + i) && wGetTokenIntTimed(TOK(i).gate_on, &v, RESYNC_WAIT_US) == WSUCCESS)
 		set_gate_on(i, v ? 1 : 0);
 		if (HAS_LINK(g_base + i) && wGetTokenIntTimed(TOK(i).clink, &v, RESYNC_WAIT_US) == WSUCCESS)
 			set_link(i, v ? 1 : 0);
-		if (with_names) {
-			buf[0] = '\0';
-			if (wGetTokenStringTimed(TOK(i).dname, buf, RESYNC_WAIT_US) == WSUCCESS) {
-				buf[sizeof buf - 1] = '\0';
-				set_name(i, buf); /* a failed read must not blank the name */
-			}
+		buf[0] = '\0';
+		if (wGetTokenStringTimed(TOK(i).dname, buf, RESYNC_WAIT_US) == WSUCCESS) {
+			buf[sizeof buf - 1] = '\0';
+			set_name(i, buf); /* a failed read must not blank the name */
 		}
 	}
 	if (wGetTokenIntTimed($STAT_SOLO, &v, RESYNC_WAIT_US) == WSUCCESS) g_stat_solo = v ? 1 : 0;
-	if (wGetTokenIntTimed($CTL_$STAT_SELIDX, &v, RESYNC_WAIT_US) == WSUCCESS)
-		set_sel(sel_index(v));
+	if (wGetTokenIntTimed($CTL_$STAT_SELIDX, &v, RESYNC_WAIT_US) == WSUCCESS) set_sel(sel_index(v));
 }
 
 /* Re-read one strip's name (used when the console reports a name change). */
@@ -648,7 +644,7 @@ static void do_connect(void) {
 		SetWindowTextA(g_ip, ip); /* show the address that was found */
 	g_connected = 1;
 	SetWindowTextA(g_connect, "Disconnect");
-	read_all(1);
+	read_all();
 	update_sel_label();
 	set_status("Connected.");
 
@@ -672,6 +668,7 @@ static void invalidate_meters(void) {
 /* Bit of the wMid request mask of the V2 meter family for source s (console
  * strip index); its records add the gate LED and the dyn state. */
 static int meter_bit(int s) {
+	if (s >= 76) return 80 + (s - 76); /* DCA (V1 family, bytes 10-11): in/out words only */
 	/* The 29-byte table in the documentation puts the V2 families at bytes 19-28;
 	 * the console's mask is 30 bytes long and the V2 families sit one byte later. */
 	if (s < 40) return 160 + s; /* channel V2: bytes 20-24 */
@@ -729,7 +726,7 @@ static void parse_meters(const unsigned char *buf, int len) {
 	id = (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
 	if (id != g_meter_id) return;
 	rec = (len - 4) / g_nvis; /* bytes of meter data per strip */
-	if (rec < V2_WORDS * 2) return;
+	if (rec < (HAS_DYN(g_base) ? V2_WORDS * 2 : 8)) return; /* a DCA record is 4 words: pre L/R, post L/R */
 
 	g_meter_dirty = 0;
 	for (i = 0; i < g_nvis; i++) {
@@ -737,8 +734,9 @@ static void parse_meters(const unsigned char *buf, int len) {
 		float v[2], old[2];
 		int og = (int) g_gate_gr[i], od = (int) g_dyn_gr[i],
 				oge = g_gate_eng[i], ode = g_dyn_eng[i];
-		float gg = fabsf((float) be16(d + 10)) / 256.0f * 20.0f;
-		float dg = fabsf((float) be16(d + 16)) / 256.0f * 20.0f;
+		int dyn = HAS_DYN(g_base + i); /* DCA records stop after the four levels */
+		float gg = dyn ? fabsf((float) be16(d + 10)) / 256.0f * 20.0f : 0.0f;
+		float dg = dyn ? fabsf((float) be16(d + 16)) / 256.0f * 20.0f : 0.0f;
 
 		old[0] = g_lvl[i][0];
 		old[1] = g_lvl[i][1];
@@ -748,7 +746,7 @@ static void parse_meters(const unsigned char *buf, int len) {
 			if (v[k] >= CLIP_DB) g_clip_until[i][k] = GetTickCount() + CLIP_HOLD_MS;
 			if (v[k] >= g_lvl[i][k]) g_lvl[i][k] = v[k];
 			else if ((g_lvl[i][k] -= METER_FALL_DB) < v[k]) g_lvl[i][k] = v[k];
-			if (g_lvl[i][k] != old[k]) g_meter_dirty = 1;
+			if ((g_lvl[i][k] < old[k] - EPSIL) || (g_lvl[i][k] > old[k] + EPSIL)) g_meter_dirty = 1;
 			{/* did the held CLIP LED change state? */
 				int cl = (int) (g_clip_until[i][k] - now) > 0;
 				if (cl != g_clip_shown[i][k]) {
@@ -760,7 +758,7 @@ static void parse_meters(const unsigned char *buf, int len) {
 		g_gate_gr[i] = (HAS_GATE(g_base + i) && gg < 100.0f) ? gg : 0.0f;
 		g_dyn_gr[i] = dg < 100.0f ? dg : 0.0f;
 		g_gate_eng[i] = HAS_GATE(g_base + i) && be16(d + 12) == 1;
-		g_dyn_eng[i] = be16(d + 18) == 1;
+		g_dyn_eng[i] = dyn && be16(d + 18) == 1;
 		if (og != (int) g_gate_gr[i] || od != (int) g_dyn_gr[i]
 				|| oge != g_gate_eng[i] || ode != g_dyn_eng[i])
 			g_meter_dirty = 1;
@@ -829,7 +827,7 @@ static void handle_event(const wTV *e) {
 		else if (e->token == TOK(i).dcol) {set_col(i, ev_int(e)); return;} /* $col: what is displayed */
 		else if (e->token == TOK(i).col) {g_name_dirty[i] = 1; return;} /* strip's own colour: re-read $col */
 		else if (e->token == TOK(i).led) {set_led(i, ev_int(e) ? 1 : 0); return;}
-		else if (e->token == TOK(i).dyn_on) {set_dyn_on(i, ev_int(e) ? 1 : 0); return;}
+		else if (HAS_DYN(g_base + i) && e->token == TOK(i).dyn_on) {set_dyn_on(i, ev_int(e) ? 1 : 0); return;}
 		else if (HAS_GATE(g_base + i) && e->token == TOK(i).gate_on) {set_gate_on(i, ev_int(e) ? 1 : 0); return;}
 		else if (HAS_LINK(g_base + i) && e->token == TOK(i).clink) {set_link(i, ev_int(e) ? 1 : 0); g_name_dirty[i] = 1; return;}
 		else if (e->token == TOK(i).fdr) {if (i != g_drag) set_fdr(i, ev_float(e)); return;}
@@ -884,7 +882,7 @@ static void pump_events(void) {
 	update_clrsolo();
 
 	if (GetTickCount() - g_last_sync >= RESYNC_MS) {
-		read_all(1); /* includes names, as a safety net */
+		read_all();
 		g_last_sync = GetTickCount();
 	}
 }
@@ -903,12 +901,14 @@ static void toggle_mute(int i) {
 }
 
 static void select_strip(int i) {
+	if (g_base + i >= 76) return; /* the console's selected-strip index has no DCA */
 	wSetTokenInt($CTL_$STAT_SELIDX, g_base + i + 1); /* console numbering: CH 1 = 1 */
 	set_sel(g_base + i);
 }
 
 static void toggle_dyn(int i) {
 	int on = (g_dyn_on[i] == 1) ? 0 : 1;
+	if (!HAS_DYN(g_base + i)) return;
 	wSetTokenInt(TOK(i).dyn_on, on);
 	set_dyn_on(i, on);
 }
@@ -986,7 +986,7 @@ static void drag_fader(int y) {
 		if (db > -0.4 && db < 0.4)
 			db = 0.0; /* snap to unity */
 	}
-	if ((float) db == g_drag_sent) return; /* nothing new to send */
+	if (((float) db > g_drag_sent - EPSIL) && ((float) db < g_drag_sent + EPSIL)) return; /* nothing new to send */
 	g_drag_sent = (float) db;
 	send_fader(g_drag, db);
 }
@@ -1066,7 +1066,7 @@ static int hit(int x, int y, int *zone) {
 		else if (x >= bx && x < bx + W_BTN && y >= Y_SEL && y < Y_SEL + H_SEL)    *zone = Z_SEL;
 		else if (x >= bx && x < bx + W_BTN && y >= Y_SOLO && y < Y_SOLO + H_SOLO)  *zone = Z_SOLO;
 		else if (x >= bx && x < bx + W_BTN && y >= Y_MUTE && y < Y_MUTE + H_MUTE) *zone = Z_MUTE;
-		else if (x >= bx && x < bx + 30 && y >= Y_METER + 2 && y < Y_METER + 16)  *zone = Z_DYN;
+		else if (x >= bx && x < bx + 30 && y >= Y_METER + 2 && y < Y_METER + 16 && HAS_DYN(g_base + i))  *zone = Z_DYN;
 		else if (x >= bx&& x < bx + 30 && y >= Y_METER + 80 && y < Y_METER + 94 && HAS_GATE(g_base + i))
 			*zone = Z_GATE;
 		else if (x >= sx + 11 && x < sx + 51 && y >= Y_FDR_TOP - H_FDR_EXT
@@ -1149,7 +1149,7 @@ static void set_bank(int b) {
 
 	/* the console reads come first, while the window still has its old size */
 	if (g_connected) {
-		read_all(1); /* also refreshes the selection */
+		read_all(); /* also refreshes the selection */
 		start_meters(); /* meters of the new bank */
 		g_last_sync = GetTickCount();
 	}
@@ -1236,7 +1236,7 @@ static void draw_meter(HDC dc, int i, int x) {
 	DWORD now = GetTickCount();
 
 	fill_rect(dc, x - 2, Y_METER, W_BTN + 4, H_METER, RGB(0, 0, 0));
-	gr_row(dc, x, Y_METER + 2, "DYN", g_dyn_gr[i], 18.0f, g_dyn_eng[i], g_dyn_on[i], 1);
+	gr_row(dc, x, Y_METER + 2, "DYN", g_dyn_gr[i], 18.0f, g_dyn_eng[i], g_dyn_on[i], HAS_DYN(g_base + i));
 	for (k = 0; k < 6; k++) {
 		int y = Y_METER + 18 + k * 10;
 		int on0 = g_lvl[i][0] >= thr[k], on1 = g_lvl[i][1] >= thr[k];
@@ -1275,7 +1275,7 @@ static void draw_strip(HDC dc, int i) {
 	fill_rect(dc, sx + 1, Y_SCRIB - 3, STRIP_W - 2, H_SCRIB + 6, sel ? RGB(255, 255, 255) : C_BG);
 	fill_rect(dc, sx + 4, Y_SCRIB, STRIP_W - 8, H_SCRIB, sc);
 	src_label(g_base + i, buf, sizeof buf);
-	text(dc, g_bold, tc, sx + 9, Y_SCRIB + 3, 40, 20, DT_LEFT, buf);
+	text(dc, g_bold, tc, sx + 9, Y_SCRIB + 3, STRIP_W - 18, 20, DT_LEFT, buf);
 	text(dc, g_font, tc, sx + 6, Y_SCRIB + 24, STRIP_W - 12, 32,
 	DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS, g_name[i]);
 
@@ -1283,7 +1283,10 @@ static void draw_strip(HDC dc, int i) {
 		draw_lock(dc, sx + LOCK_X, Y_SCRIB + 4, g_link[i] == CLINK_LINKED, tc);
 
 	/* SELECT / SOLO / MUTE */
-	button(dc, bx, Y_SEL, W_BTN, H_SEL, sel ? C_SELECT : C_DARK, sel ? RGB(0, 0, 0) : RGB(255, 255, 255), "SELECT");
+	if (g_base + i >= 76) /* a DCA cannot be selected: greyed out */
+		button(dc, bx, Y_SEL, W_BTN, H_SEL, RGB(150, 150, 152), RGB(110, 110, 112), "SELECT");
+	else
+		button(dc, bx, Y_SEL, W_BTN, H_SEL, sel ? C_SELECT : C_DARK, sel ? RGB(0, 0, 0) : RGB(255, 255, 255), "SELECT");
 	button(dc, bx, Y_SOLO, W_BTN, H_SOLO, g_solo[i] == 1 ? C_SOLO : C_DARK, g_solo[i] == 1 ? RGB(0, 0, 0) : RGB(255, 255, 255), "SOLO");
 	draw_meter(dc, i, bx);
 	button(dc, bx, Y_MUTE, W_BTN, H_MUTE, mc, RGB(255, 255, 255), "MUTE");
@@ -1419,7 +1422,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			X_MARGIN, bank_y(k), BANK_W, 28, hwnd, ID_BANK0 + k);
 
 		g_sellbl = make("STATIC", "Selected:\r\n--", 0,
-		X_MARGIN, bank_y(NBANK - 1) + 44, BANK_W, 110, hwnd, ID_SELLBL);
+		X_MARGIN, bank_y(NBANK - 1) + 36, BANK_W, Y_STATUS - bank_y(NBANK - 1) - 40, hwnd, ID_SELLBL);
 		SendMessage(g_sellbl, WM_SETFONT, (WPARAM) g_font, TRUE);
 		g_status = make("STATIC", "Not connected", 0,
 		X_MARGIN, Y_STATUS, 680, H_STATUS, hwnd, ID_STATUS);
@@ -1523,6 +1526,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		DeleteObject(g_bg);
 		PostQuitMessage(0);
 		return 0;
+
+	default:
+		break;
 	}
 	return DefWindowProcA(hwnd, msg, wp, lp);
 }
