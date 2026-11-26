@@ -1,6 +1,6 @@
 /*
  * wpanel.c - a variable size strip remote panel for a Behringer WING, using wapi.
- * wpanel v 0.1.1 - (c) 2026 - Patrick-Gilles Maillot
+ * wpanel v 0.1.2 - (c) 2026 - Patrick-Gilles Maillot
  * Windows (Win32) GUI.
  *
  *   gcc -O3 -Wall -I<wapi include dir> -o wpanel.exe wpanel.c \
@@ -21,7 +21,7 @@
  * The source currently selected on the console is highlighted and reported in
  * the top bar, whichever bank is showing.
  *
- * Finding the console: with an empty address box, Connect (or Find) calls
+ * Finding the console: with an empty address box, Connect calls
  * wOpen(""), which searches the network, connects to the first WING found and
  * returns its IP address (shown in the box).
  *
@@ -36,6 +36,12 @@
  *          Meters connection port & ID based on time rather than process ID as this would conduct at
  *            non working meters when disconnecting/reconnecting within the same process
  *          Better definitions of size & position of buttons and GUI elements
+ * v 0.1.2: Increased max number of events (avoid crash if too many of them wer incoming after scene load)
+ *          Better management of name changing when link/no-link
+ *          Better management of name changing when link/no-link
+ *          Added a Clear Solo button
+ *          Added coloring scheme to buttons
+ *          Added scribble lighting OFF state (LED = 0) and adapted the color based on the C-LINK state
  */
 #include <math.h>
 #include <windows.h>
@@ -50,7 +56,7 @@
 /* ---- configuration ------------------------------------------------------ */
 #define TICK_MS        25        /* event loop period                        */
 #define EVENT_WAIT_US  1000      /* max time one tick waits for events (µs)  */
-#define MAX_EVENTS     100       /* wapi events buffer size                  */
+#define MAX_EVENTS     512       /* wapi events buffer size                  */
 #define RESYNC_MS      5000      /* full re-read of every visible value      */
 #define RESYNC_WAIT_US 50000     /* per-token wait during a resync (µs)      */
 #define S_STRINGS      24        /* size of strings arrays                   */
@@ -63,18 +69,25 @@
 #define CLIP_HOLD_MS  500        /* the CLIP LED stays lit this long after a peak */
 #define CLIP_DB       (-1.0f)    /* level that counts as clipping              */
 
-/* ---- every source the panel can show: CH 1..40, AUX 1..8, BUS 1..16, MAIN 1..4, MTX 1..8 ------------ */
+/* ---- The panel can show: CH 1..40, AUX 1..8, BUS 1..16, MAIN 1..4, MTX 1..8 -------- */
 /* Source number s equals the console's own strip index (0 = CH 1 ... 39 = CH 40,
- * 40 = AUX 1 ... 47 = AUX 8, 48..63 = BUS 1..16, 64..67 = MAIN 1..4, 68..75 = MTX 1..8), which is also what the selected-strip token uses. */
+ * 40 = AUX 1 ... 47 = AUX 8, 48..63 = BUS 1..16, 64..67 = MAIN 1..4, 68..75 = MTX 1..8),
+ * which is also what the selected-strip token uses. */
+
+/* In Source below, 'name' is used to set name for un-linked channels, while 'dname'
+ * is used to get $name, which truly represents what's displayed on the scribble (linked
+ * or unlinked channel (see CLINK_LINKED). The colour follows the same logic: 'dcol'
+ * ($col) is what is displayed, 'col' the strip's own setting. */
 typedef struct {
-	wtoken mute, solo, name, col, fdr, dname, dyn_on, gate_on, clink;
+	wtoken mute, solo, name, col, fdr, dname, dyn_on, gate_on, clink, led, dcol;
 } Source;
 #define NSRC 76
 static Source SRC[NSRC];
 #define HAS_GATE(s) ((s) < 40)       /* only the input channels have a gate */
 #define HAS_LINK(s) ((s) < 48)       /* "link to source" exists on channels and aux only */
 #define CLINK_LINKED 1               /* value of the clink token when linked to the source
-                                      * (clink = "custom link"; with the value below the padlock is drawn closed) */
+                                      * (clink = "custom link"; with the value below the
+                                      * padlock is drawn closed) */
 /* The tokens of each source family (CH, AUX, BUS, MAIN, MTX) are laid out at a
  * constant distance in wapi.h's enum: CH_2_MUTE - CH_1_MUTE is the same for every
  * channel and for every field. So each family is described by its first two
@@ -83,7 +96,7 @@ static Source SRC[NSRC];
  * produce wrong tokens (the build would stop instead). */
 
 #define FIELDS(P, N) {P##_##N##_MUTE, P##_##N##_$SOLO, P##_##N##_NAME, P##_##N##_COL, \
-                      P##_##N##_FDR,  P##_##N##_$NAME, P##_##N##_DYN_ON, GATE_##P(N), LINK_##P(N)}
+                      P##_##N##_FDR,  P##_##N##_$NAME, P##_##N##_DYN_ON, GATE_##P(N), LINK_##P(N), P##_##N##_LED, P##_##N##_$COL}
 #define GATE_CH(N)     CH_##N##_GATE_ON         /* only input channels have a gate; */
 #define GATE_AUX(N)   AUX_##N##_DYN_ON          /* the others reuse the DYN token   */
 #define GATE_BUS(N)   BUS_##N##_DYN_ON          /* (it is never used, see HAS_GATE) */
@@ -102,7 +115,7 @@ static Source SRC[NSRC];
 #define CHECK_FAMILY(P, L) \
     CHECK_FIELD(P, L, MUTE); CHECK_FIELD(P, L, $SOLO); CHECK_FIELD(P, L, NAME); \
     CHECK_FIELD(P, L, COL);  CHECK_FIELD(P, L, FDR);   CHECK_FIELD(P, L, $NAME); \
-    CHECK_FIELD(P, L, DYN_ON)
+    CHECK_FIELD(P, L, DYN_ON); CHECK_FIELD(P, L, LED); CHECK_FIELD(P, L, $COL)
 
 CHECK_FAMILY(CH, 40);
 CHECK_FAMILY(AUX, 8);
@@ -149,22 +162,24 @@ static const Bank BANKS[] = {
 		{"AUX 1-8", 40, 8},
 		{"BUS 1-8", 48, 8}, {"BUS 9-16", 56, 8}, {"BUS 1-16", 48, 16},
 		{"MAIN 1-4", 64, 4}, {"MTX 1-8", 68, 8},};
-#define NBANK sizeof(BANKS) / sizeof (Bank)
+#define NBANK ((int)(sizeof(BANKS) / sizeof(Bank)))
 
 #define GROUP  4
 #define NSTRIP 4 * GROUP /* max number of strips shown at once (4 groups of 4) */
 
 /* ---- layout (pixels) ----------------------------------------------------- */
-#define WPANEL_VERSION "0.1.1"
+#define WPANEL_VERSION "0.1.2"
 #define WPANEL_TITLE   "wpanel - (c) 2026 - Patrick-Gilles Maillot - v " WPANEL_VERSION
 
 #define STRIP_W      90
 #define GROUP_GAP    9 
-#define H_BTN        28
 #define X_MARGIN     14
 #define Y_MARGIN     8
-#define BTN_X        8
-#define BTN_W        (STRIP_W - 2 * BTN_X)
+#define H_BTN        28           /* button height                             */
+#define S_BTN        4            /* distance between buttons in a same family */
+#define F_BTN        10           /* distance between families of buttons      */
+#define X_BTN        8
+#define W_BTN        (STRIP_W - 2 * X_BTN)
 #define LOCK_X       70           /* padlock on the scribble strip: offset from the strip x */
 #define LOCK_W       10
 #define LOCK_H       13
@@ -197,9 +212,9 @@ static const Bank BANKS[] = {
 
 enum {
 	ID_IP = 101,
-	ID_FIND,
 	ID_CONNECT,
 	ID_METERMODE,
+	ID_CLEARSOLO,
 	ID_STATUS,
 	ID_SELLBL,
 	ID_TIMER,
@@ -218,7 +233,7 @@ enum {
 /* WING color indices 1..18, taken from the colour table of the WING Remote
  * Protocols document (page 249). Index 0 is used while a colour is unknown. */
 #define NCOLORS 18
-static const COLORREF WCOL[NCOLORS + 1] = {RGB(110, 110, 110), /*  0: unknown            */
+static const COLORREF WCOL[NCOLORS + 1] = {RGB(64,  64,  68),   /*  0: unknown, or scribble light off */
 RGB(75, 100, 207),  /*  1                     */
 RGB(61, 130, 255),  /*  2                     */
 RGB(94, 60, 255),   /*  3                     */
@@ -249,10 +264,12 @@ static const int SCALE_LABELS[] = {10, 5, 0, -5, -10, -20, -30, -40, -50, -60};
 
 /* ---- state -------------------------------------------------------------- */
 static HWND g_metermode;
-static HWND g_wnd, g_ip, g_find, g_connect, g_status, g_sellbl, g_bankbtn[NBANK];
+static HWND g_wnd, g_ip, g_clrsolo, g_connect, g_status, g_sellbl, g_bankbtn[NBANK];
 static HFONT g_font, g_bold, g_small, g_smallbold, g_tiny;
 static HBRUSH g_bg;
 static int g_connected = 0;
+static int g_stat_solo = -1; /* console's "any solo active" status: -1 unknown, 0, 1 */
+static int g_clr_shown = 0; /* ClrSolo button state last drawn (1 = yellow) */
 
 static int g_bank = 0;  /* current bank                 */
 static int g_base = 0;  /* source shown on strip 0      */
@@ -260,6 +277,7 @@ static int g_nvis = 12; /* strips in use in this bank   */
 
 /* per-strip values (indexed by strip 0..11, not by source) */
 static int g_mute[NSTRIP], g_solo[NSTRIP], g_col[NSTRIP]; /* -1 = unknown */
+static int g_led[NSTRIP]; /* scribble light: -1 unknown, 0 off, 1 on */
 static float g_fdr[NSTRIP]; /* dB */
 static int g_fdr_ok[NSTRIP];
 static char g_name[NSTRIP][S_STRINGS];
@@ -313,17 +331,17 @@ static int strip_x(int i) {
 /* Client width needed for n strips */
 static int client_width(int n) {
 	/* right edge of the last strip's buttons, plus a small right X_MARGIN */
-	int w = strip_x(n > 0 ? n - 1 : 0) + BTN_X + BTN_W + RIGHT_PAD;
+	int w = strip_x(n > 0 ? n - 1 : 0) + X_BTN + W_BTN + RIGHT_PAD;
 	return w;
 }
 
 /* y of bank button k: a small gap between CH / AUX / BUS / MAIN / MTX families */
 static int bank_y(int k) {
 	static const int fam[5] = {4, 7, 8, 11, 12}; /* first button of each group of banks */
-	int j, y = Y_SCRIB + k * 32;
+	int j, y = Y_SCRIB + k * (H_BTN + S_BTN);
 	for (j = 0; j < 5; j++)
 		if (k >= fam[j])
-			y += 10;
+			y += F_BTN;
 	return y;
 }
 
@@ -334,8 +352,8 @@ static void apply_layout(void) {
 	RECT rc = {0, 0, cw, Y_STATUS + H_STATUS + BOTTOM_PAD};
 	AdjustWindowRect(&rc, style, FALSE);
 	SetWindowPos(g_wnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
-	SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-	SetWindowPos(g_status, NULL, 0, 0, cw - 2 * X_MARGIN, H_STATUS, SWP_NOMOVE | SWP_NOZORDER);
+	SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOREDRAW);
+	SetWindowPos(g_status, NULL, 0, 0, cw - 2 * X_MARGIN, H_STATUS, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW);
 	InvalidateRect(g_wnd, NULL, FALSE);
 }
 
@@ -353,7 +371,7 @@ static void invalidate_strip(int i) {
 }
 
 static void invalidate_all(void) {
-	RECT r = {0, STRIP_TOP, 4000, STRIP_BOT + 2};
+	RECT r = {0, STRIP_TOP, client_width(g_nvis), STRIP_BOT + 2};
 	InvalidateRect(g_wnd, &r, FALSE);
 }
 
@@ -429,6 +447,12 @@ static void set_link(int i, int v) {
 		invalidate_strip(i);
 	}
 }
+static void set_led(int i, int v) {
+	if (g_led[i] != v) {
+		g_led[i] = v;
+		invalidate_strip(i);
+	}
+}
 static void set_col(int i, int v) {
 	if (g_col[i] != v) {
 		g_col[i] = v;
@@ -485,7 +509,7 @@ static void set_sel(int idx) {
 static void reset_strips(void) {
 	int i;
 	for (i = 0; i < NSTRIP; i++) {
-		g_mute[i] = g_solo[i] = g_col[i] = -1;
+		g_mute[i] = g_solo[i] = g_col[i] = g_led[i] = -1;
 		g_fdr_ok[i] = 0;
 		g_fdr[i] = 0;
 		g_name[i][0] = '\0';
@@ -512,12 +536,15 @@ static void reset_strips_meters(void) {
 }
 
 static void reset_data(void) {
+	g_stat_solo = -1;
 	reset_strips();
 	g_sel = -1;
 	g_selname[0] = '\0';
 }
 
 /* ---- connection --------------------------------------------------------- */
+static void update_clrsolo(void);
+
 static void disconnect(const char *why) {
 	KillTimer(g_wnd, ID_TIMER);
 	if (g_connected) wClose();
@@ -532,6 +559,7 @@ static void disconnect(const char *why) {
 	update_sel_label();
 	invalidate_all();
 	set_status(why);
+	update_clrsolo(); /* back to grey */
 }
 
 /* Read every value of the visible strips from the console. The wapi getters
@@ -548,8 +576,9 @@ static void read_all(int with_names) {
 		set_mute(i, v);
 		if (wGetTokenIntTimed(TOK(i).solo, &v, RESYNC_WAIT_US) != WSUCCESS) return;
 		set_solo(i, v ? 1 : 0);
-		if (wGetTokenIntTimed(TOK(i).col, &v, RESYNC_WAIT_US) != WSUCCESS) return;
+		if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) != WSUCCESS) return;
 		set_col(i, v);
+		if (wGetTokenIntTimed(TOK(i).led, &v, RESYNC_WAIT_US) == WSUCCESS) set_led(i, v ? 1 : 0);
 		if (wGetTokenFloatTimed(TOK(i).fdr, &f, RESYNC_WAIT_US) != WSUCCESS) return;
 		if (i != g_drag) set_fdr(i, f); /* don't fight the mouse */
 		if (wGetTokenIntTimed(TOK(i).dyn_on, &v, RESYNC_WAIT_US) == WSUCCESS) set_dyn_on(i, v ? 1 : 0);
@@ -559,21 +588,27 @@ static void read_all(int with_names) {
 			set_link(i, v ? 1 : 0);
 		if (with_names) {
 			buf[0] = '\0';
-			if (wGetTokenStringTimed(TOK(i).name, buf, RESYNC_WAIT_US) == WSUCCESS) {
+			if (wGetTokenStringTimed(TOK(i).dname, buf, RESYNC_WAIT_US) == WSUCCESS) {
 				buf[sizeof buf - 1] = '\0';
 				set_name(i, buf); /* a failed read must not blank the name */
 			}
 		}
 	}
+	if (wGetTokenIntTimed($STAT_SOLO, &v, RESYNC_WAIT_US) == WSUCCESS) g_stat_solo = v ? 1 : 0;
 	if (wGetTokenIntTimed($CTL_$STAT_SELIDX, &v, RESYNC_WAIT_US) == WSUCCESS)
 		set_sel(sel_index(v));
 }
 
 /* Re-read one strip's name (used when the console reports a name change). */
+static void refresh_col(int i) {
+	int v;
+	if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) == WSUCCESS) set_col(i, v);
+	if (wGetTokenIntTimed(TOK(i).led, &v, RESYNC_WAIT_US) == WSUCCESS) set_led(i, v ? 1 : 0); /* no $led token exists */
+}
 static void refresh_name(int i) {
 	char buf[256];
 	buf[0] = '\0';
-	if (wGetTokenStringTimed(TOK(i).name, buf, RESYNC_WAIT_US) == WSUCCESS) {
+	if (wGetTokenStringTimed(TOK(i).dname, buf, RESYNC_WAIT_US) == WSUCCESS) {
 		buf[sizeof buf - 1] = '\0';
 		set_name(i, buf);
 	}
@@ -620,13 +655,6 @@ static void do_connect(void) {
 	start_meters(); /* may replace the status if meters fail */
 	g_last_sync = GetTickCount();
 	SetTimer(g_wnd, ID_TIMER, TICK_MS, NULL);
-}
-
-/* "Find": forget the typed address and let wOpen() search. */
-static void do_find(void) {
-	if (g_connected) return;
-	SetWindowTextA(g_ip, "");
-	do_connect();
 }
 
 /* ---- meters (wapi metering API) ------------------------------------------ */
@@ -767,6 +795,21 @@ static float ev_float(const wTV *e) {
 	return e->type == I32 ? (float) e->d.idata : e->d.fdata;
 }
 
+/* ClrSolo turns yellow while a solo is engaged (console status, or a visible strip). */
+static void update_clrsolo(void) {
+	int i, active = 0;
+
+	if (g_connected) {
+		active = (g_stat_solo == 1);
+		for (i = 0; i < g_nvis; i++)
+			if (g_solo[i] == 1) active = 1;
+	}
+	if (active != g_clr_shown) {
+		g_clr_shown = active;
+		if (g_clrsolo) InvalidateRect(g_clrsolo, NULL, FALSE);
+	}
+}
+
 static void handle_event(const wTV *e) {
 	int i;
 
@@ -775,22 +818,24 @@ static void handle_event(const wTV *e) {
 		return;
 	}
 
+	if (e->token == $STAT_SOLO) {
+		g_stat_solo = ev_int(e) ? 1 : 0;
+		return;
+	}
+
 	for (i = 0; i < g_nvis; i++) {/* only what is on screen */
 		if (e->token == TOK(i).mute) {set_mute(i, ev_int(e) ? 1 : 0); return;}
 		else if (e->token == TOK(i).solo) {set_solo(i, ev_int(e) ? 1 : 0); return;}
-		else if (e->token == TOK(i).col) {set_col(i, ev_int(e)); return;}
+		else if (e->token == TOK(i).dcol) {set_col(i, ev_int(e)); return;} /* $col: what is displayed */
+		else if (e->token == TOK(i).col) {g_name_dirty[i] = 1; return;} /* strip's own colour: re-read $col */
+		else if (e->token == TOK(i).led) {set_led(i, ev_int(e) ? 1 : 0); return;}
 		else if (e->token == TOK(i).dyn_on) {set_dyn_on(i, ev_int(e) ? 1 : 0); return;}
 		else if (HAS_GATE(g_base + i) && e->token == TOK(i).gate_on) {set_gate_on(i, ev_int(e) ? 1 : 0); return;}
 		else if (HAS_LINK(g_base + i) && e->token == TOK(i).clink) {set_link(i, ev_int(e) ? 1 : 0); g_name_dirty[i] = 1; return;}
 		else if (e->token == TOK(i).fdr) {if (i != g_drag) set_fdr(i, ev_float(e)); return;}
-		else if (e->token == TOK(i).name) {
-			/* The event itself is the truth: a string event with no text (NULL or "")
-			 * or an event carrying no string at all means the name was cleared. */
+		else if (e->token == TOK(i).dname) {
+			/* $name is truly representing what's on WING scribbles */
 			set_name(i, (e->type == S32 && e->d.sdata) ? e->d.sdata : "");
-			return;
-		}
-		else if (e->token == TOK(i).dname) {/* displayed name changed: re-read it */
-			g_name_dirty[i] = 1;
 			return;
 		}
 	}
@@ -809,10 +854,17 @@ static void pump_events(void) {
 	}
 
 	do {
-		n = wGetParsedEventsTimed(tv, MAX_EVENTS, EVENT_WAIT_US);
-		if (n < 0) {
+		if ((n = wGetParsedEventsTimed(tv, MAX_EVENTS, EVENT_WAIT_US)) < 0) {
 			disconnect("Connection lost.");
 			return;
+		}
+		if (n > MAX_EVENTS - 20) {
+			for (k = 0; k < 10; k++) {
+				set_status("!!! Events OVERFLOW !!!");
+				Sleep(100);
+				set_status("");
+				Sleep(100);
+			}
 		}
 		for (k = 0; k < n; k++) {
 			handle_event(&tv[k]);
@@ -825,9 +877,11 @@ static void pump_events(void) {
 		if (g_name_dirty[k]) {
 			g_name_dirty[k] = 0;
 			refresh_name(k);
+			refresh_col(k); /* name and colour both follow the link to the source */
 		}
 
 	pump_meters();
+	update_clrsolo();
 
 	if (GetTickCount() - g_last_sync >= RESYNC_MS) {
 		read_all(1); /* includes names, as a safety net */
@@ -837,8 +891,8 @@ static void pump_events(void) {
 
 /* ---- actions ------------------------------------------------------------ */
 static void toggle_mute(int i) {
-	int muted = -1;
-	wGetTokenInt(TOK(i).mute, &muted); /* toggle from the real state */
+	int muted = g_mute[i]; /* the state we track: the console pushes every change */
+	if (muted != 0 && muted != 1) wGetTokenInt(TOK(i).mute, &muted); /* unknown: ask once */
 	if (muted != 0 && muted != 1) {
 		set_status("No answer from console.");
 		return;
@@ -873,6 +927,24 @@ static void toggle_link(int i) {
 	wSetTokenInt(TOK(i).clink, clink);
 	set_link(i, clink);
 	g_name_dirty[i] = 1;
+}
+
+/* Clear every solo: switch off the solo of all 76 sources (not only the strips
+ * on screen) that have it on. Stops at the first token that does not answer. */
+static void clear_solo(void) {
+	int s, v, i;
+
+	if (!g_connected) return;
+	for (s = 0; s < NSRC; s++) {
+		if (wGetTokenIntTimed(SRC[s].solo, &v, RESYNC_WAIT_US) != WSUCCESS) break;
+		if (v == 1) {
+			wSetTokenInt(SRC[s].solo, 0);
+			i = s - g_base;
+			if (i >= 0 && i < g_nvis) set_solo(i, 0); /* the console confirms via an event */
+		}
+	}
+	g_stat_solo = 0; /* the console's own status corrects this if some solo is left */
+	update_clrsolo();
 }
 
 static void toggle_solo(int i) {
@@ -937,7 +1009,7 @@ static LRESULT CALLBACK edit_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static void finish_edit(void) {
-	char buf[64];
+	char buf[S_STRINGS];
 	int i = g_edit_strip;
 	HWND e = g_edit;
 
@@ -948,18 +1020,14 @@ static void finish_edit(void) {
 	DestroyWindow(e);
 
 	if (g_edit_commit && g_connected && i >= 0 && i < g_nvis) {
-		char back[256];
-		int rc;
-
 		buf[16] = '\0'; /* WING names: 16 characters max */
-		rc = wSetTokenString(TOK(i).name, buf);
-		set_name(i, buf); /* instant feedback */
-
-		/* Read the name back, so the strip shows what the console really holds. */
-		back[0] = '\0';
-		if (rc > 0 && wGetTokenStringTimed(TOK(i).name, back, RESYNC_WAIT_US) == WSUCCESS) {
-			back[sizeof back - 1] = '\0';
-			set_name(i, back);
+		if (wSetTokenString(TOK(i).name, buf) == WSUCCESS) {
+			/* Read the name back into buf[], so the strip shows what the console scribble holds. */
+			buf[0] = '\0';
+			if (wGetTokenStringTimed(TOK(i).dname, buf, RESYNC_WAIT_US) == WSUCCESS) {
+				buf[sizeof buf - 1] = '\0';
+				set_name(i, buf);
+			}
 		}
 	}
 }
@@ -968,7 +1036,6 @@ static void start_edit(int i) {
 	int sx = strip_x(i);
 
 	if (!g_connected) return;
-	finish_edit();
 	g_edit_commit = 1; /* leaving the box also commits */
 	g_edit_strip = i;
 	g_edit = CreateWindowExA(0, "EDIT", g_name[i],
@@ -990,15 +1057,15 @@ static int hit(int x, int y, int *zone) {
 	int i;
 	*zone = Z_NONE;
 	for (i = 0; i < g_nvis; i++) {
-		int sx = strip_x(i), bx = sx + BTN_X;
+		int sx = strip_x(i), bx = sx + X_BTN;
 		if (x < sx || x >= sx + STRIP_W)
 			continue;
 		if (HAS_LINK(g_base + i) && x >= sx + LOCK_X - 3 && x < sx + LOCK_X + LOCK_W + 3
 				&& y >= Y_SCRIB && y < Y_SCRIB + LOCK_H + 8)                      *zone = Z_LINK;
 		else if (y >= Y_SCRIB && y < Y_SCRIB + H_SCRIB)                           *zone = Z_SCRIB;
-		else if (x >= bx && x < bx + BTN_W && y >= Y_SEL && y < Y_SEL + H_SEL)    *zone = Z_SEL;
-		else if (x >= bx && x < bx + BTN_W && y >= Y_SOLO && y < Y_SOLO + H_SOLO)  *zone = Z_SOLO;
-		else if (x >= bx && x < bx + BTN_W && y >= Y_MUTE && y < Y_MUTE + H_MUTE) *zone = Z_MUTE;
+		else if (x >= bx && x < bx + W_BTN && y >= Y_SEL && y < Y_SEL + H_SEL)    *zone = Z_SEL;
+		else if (x >= bx && x < bx + W_BTN && y >= Y_SOLO && y < Y_SOLO + H_SOLO)  *zone = Z_SOLO;
+		else if (x >= bx && x < bx + W_BTN && y >= Y_MUTE && y < Y_MUTE + H_MUTE) *zone = Z_MUTE;
 		else if (x >= bx && x < bx + 30 && y >= Y_METER + 2 && y < Y_METER + 16)  *zone = Z_DYN;
 		else if (x >= bx&& x < bx + 30 && y >= Y_METER + 80 && y < Y_METER + 94 && HAS_GATE(g_base + i))
 			*zone = Z_GATE;
@@ -1067,8 +1134,6 @@ static void dblclick(int x, int y) {
 
 /* ---- banks --------------------------------------------------------------- */
 static void set_bank(int b) {
-	int k;
-
 	g_edit_commit = 0; /* drop a half-typed name */
 	finish_edit();
 	if (g_drag >= 0) {
@@ -1076,15 +1141,13 @@ static void set_bank(int b) {
 		ReleaseCapture();
 	}
 
-	g_bank = b;
+	SendMessage(g_wnd, WM_SETREDRAW, FALSE, 0); /* no intermediate (blank) paint: */
+	g_bank = b;                                  /* the new bank appears once, with its data */
 	g_base = BANKS[b].base;
 	g_nvis = BANKS[b].count;
 	reset_strips(); /* values belong to the old bank */
-	apply_layout(); /* window width follows the strip count */
-	for (k = 0; k < NBANK; k++)
-		SendMessage(g_bankbtn[k], BM_SETCHECK, k == b ? BST_CHECKED : BST_UNCHECKED, 0);
-	invalidate_all();
 
+	/* the console reads come first, while the window still has its old size */
 	if (g_connected) {
 		read_all(1); /* also refreshes the selection */
 		start_meters(); /* meters of the new bank */
@@ -1092,6 +1155,11 @@ static void set_bank(int b) {
 	}
 	refresh_selname();
 	update_sel_label();
+
+	apply_layout(); /* window width follows the strip count (still not drawing) */
+	SendMessage(g_wnd, WM_SETREDRAW, TRUE, 0);
+	/* invalidates the whole window and its children, bank buttons included */
+	RedrawWindow(g_wnd, NULL, NULL, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN);
 }
 
 /* ---- drawing ------------------------------------------------------------ */
@@ -1167,7 +1235,7 @@ static void draw_meter(HDC dc, int i, int x) {
 	int k;
 	DWORD now = GetTickCount();
 
-	fill_rect(dc, x - 2, Y_METER, BTN_W + 4, H_METER, RGB(0, 0, 0));
+	fill_rect(dc, x - 2, Y_METER, W_BTN + 4, H_METER, RGB(0, 0, 0));
 	gr_row(dc, x, Y_METER + 2, "DYN", g_dyn_gr[i], 18.0f, g_dyn_eng[i], g_dyn_on[i], 1);
 	for (k = 0; k < 6; k++) {
 		int y = Y_METER + 18 + k * 10;
@@ -1194,9 +1262,9 @@ static void draw_lock(HDC dc, int x, int y, int linked, COLORREF c) {
 }
 
 static void draw_strip(HDC dc, int i) {
-	int sx = strip_x(i), bx = sx + BTN_X, tx = sx + 30, k, y;
+	int sx = strip_x(i), bx = sx + X_BTN, tx = sx + 30, k, y;
 	int sel = (g_sel == g_base + i);
-	COLORREF sc = (g_col[i] >= 1 && g_col[i] <= NCOLORS) ? WCOL[g_col[i]] : WCOL[0];
+	COLORREF sc = (g_led[i] != 0 && g_col[i] >= 1 && g_col[i] <= NCOLORS) ? WCOL[g_col[i]] : WCOL[0]; /* light off: dark grey */
 	COLORREF mc = g_mute[i] == 1 ? C_MUTED : g_mute[i] == 0 ? C_LIVE : C_UNKNOWN;
 	char buf[32];
 	/* dark text on light colours, white text on dark ones */
@@ -1215,10 +1283,10 @@ static void draw_strip(HDC dc, int i) {
 		draw_lock(dc, sx + LOCK_X, Y_SCRIB + 4, g_link[i] == CLINK_LINKED, tc);
 
 	/* SELECT / SOLO / MUTE */
-	button(dc, bx, Y_SEL, BTN_W, H_SEL, sel ? C_SELECT : C_DARK, sel ? RGB(0, 0, 0) : RGB(255, 255, 255), "SELECT");
-	button(dc, bx, Y_SOLO, BTN_W, H_SOLO, g_solo[i] == 1 ? C_SOLO : C_DARK, g_solo[i] == 1 ? RGB(0, 0, 0) : RGB(255, 255, 255), "SOLO");
+	button(dc, bx, Y_SEL, W_BTN, H_SEL, sel ? C_SELECT : C_DARK, sel ? RGB(0, 0, 0) : RGB(255, 255, 255), "SELECT");
+	button(dc, bx, Y_SOLO, W_BTN, H_SOLO, g_solo[i] == 1 ? C_SOLO : C_DARK, g_solo[i] == 1 ? RGB(0, 0, 0) : RGB(255, 255, 255), "SOLO");
 	draw_meter(dc, i, bx);
-	button(dc, bx, Y_MUTE, BTN_W, H_MUTE, mc, RGB(255, 255, 255), "MUTE");
+	button(dc, bx, Y_MUTE, W_BTN, H_MUTE, mc, RGB(255, 255, 255), "MUTE");
 
 	/* fader track and dB scale */
 	fill_rect(dc, tx - 2, Y_FDR_TOP - 6, 4, Y_FDR_BOT - Y_FDR_TOP + 12, RGB(0, 0, 0));
@@ -1295,7 +1363,7 @@ static void paint(HWND hwnd) {
 		int sx = strip_x(i);
 		if (sx + STRIP_W < pr.left || sx > pr.right)
 			continue; /* not in the dirty area */
-		if (meters_only) draw_meter(mem, i, sx + BTN_X);
+		if (meters_only) draw_meter(mem, i, sx + X_BTN);
 		else             draw_strip(mem, i);
 	}
 
@@ -1334,22 +1402,21 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		g_tiny = mkfont(10, FW_BOLD);
 		reset_data();
 
-		make("STATIC", "WING IP:", 0, X_MARGIN, 16, 66, 24, hwnd, 0);
+		make("STATIC", "IP", 0, X_MARGIN, 16, 20, 24, hwnd, 0);
 		g_ip = make("EDIT", "", WS_BORDER | ES_AUTOHSCROLL,
-		X_MARGIN + 70, 12, 120, 28, hwnd, ID_IP);
-		g_find = make("BUTTON", "Find", BS_PUSHBUTTON,
-		X_MARGIN + 194, 12, 48, 28, hwnd, ID_FIND);
+		X_MARGIN + 24, 12, 136, 28, hwnd, ID_IP); /* room for 16 characters */
 		g_connect = make("BUTTON", "Connect", BS_PUSHBUTTON,
-		X_MARGIN + 246, 12, 80, 28, hwnd, ID_CONNECT);
+		X_MARGIN + 164, 12, 80, 28, hwnd, ID_CONNECT);
 
-		g_metermode = make("BUTTON", "Meters: PRE", BS_PUSHBUTTON,
-		X_MARGIN + 330, 12, 98, 28, hwnd, ID_METERMODE);
+		g_metermode = make("BUTTON", "Meters: PRE", BS_OWNERDRAW,
+		X_MARGIN + 248, 12, 92, 28, hwnd, ID_METERMODE);
+		g_clrsolo = make("BUTTON", "ClrSolo", BS_OWNERDRAW,
+		X_MARGIN + 344, 12, 64, 28, hwnd, ID_CLEARSOLO);
 
 		for (k = 0; k < NBANK; k++)
 			g_bankbtn[k] = make("BUTTON", BANKS[k].label,
-			BS_AUTORADIOBUTTON | BS_PUSHLIKE | (k == 0 ? WS_GROUP : 0),
+			BS_OWNERDRAW,
 			X_MARGIN, bank_y(k), BANK_W, 28, hwnd, ID_BANK0 + k);
-		SendMessage(g_bankbtn[0], BM_SETCHECK, BST_CHECKED, 0);
 
 		g_sellbl = make("STATIC", "Selected:\r\n--", 0,
 		X_MARGIN, bank_y(NBANK - 1) + 44, BANK_W, 110, hwnd, ID_SELLBL);
@@ -1358,8 +1425,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		X_MARGIN, Y_STATUS, 680, H_STATUS, hwnd, ID_STATUS);
 		return 0;
 
-	case WM_ERASEBKGND:
-		return 1; /* paint() draws everything */
+	case WM_ERASEBKGND: { /* paint() draws everything; only newly exposed area (window growing) needs a fill */
+		RECT er;
+		GetClientRect(hwnd, &er);
+		FillRect((HDC) wp, &er, g_bg);
+		return 1;
+	}
 
 	case WM_CTLCOLORSTATIC:
 		SetBkColor((HDC) wp, C_BG);
@@ -1395,15 +1466,37 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		finish_edit();
 		return 0;
 
-	case WM_STARTUP: /* look for a console at start-up */
-		do_find();
+	case WM_STARTUP: /* look for a console at start-up (the address box is empty) */
+		do_connect();
 		return 0;
+
+	case WM_DRAWITEM: {
+		const DRAWITEMSTRUCT *di = (const DRAWITEMSTRUCT *) lp;
+		if (di->CtlID == ID_CLEARSOLO) {
+			button(di->hDC, 0, 0, di->rcItem.right, di->rcItem.bottom,
+					g_clr_shown ? C_SOLO : C_DARK, g_clr_shown ? RGB(0, 0, 0) : RGB(255, 255, 255), "ClrSolo");
+			return TRUE;
+		}
+		if (di->CtlID == ID_METERMODE) {
+			button(di->hDC, 0, 0, di->rcItem.right, di->rcItem.bottom,
+					g_meter_post ? RGB(190, 70, 70) : RGB(70, 150, 80), RGB(255, 255, 255),
+					g_meter_post ? "Meters: POST" : "Meters: PRE");
+			return TRUE;
+		}
+		if (di->CtlID >= ID_BANK0 && di->CtlID < ID_BANK0 + (UINT) NBANK) {
+			int k = (int) (di->CtlID - ID_BANK0), on = (k == g_bank);
+			button(di->hDC, 0, 0, di->rcItem.right, di->rcItem.bottom,
+					on ? C_SOLO : C_DARK, on ? RGB(0, 0, 0) : RGB(255, 255, 255), BANKS[k].label);
+			return TRUE;
+		}
+		break;
+	}
 
 	case WM_COMMAND:
 		if (LOWORD(wp) == ID_CONNECT)
 			do_connect();
-		else if (LOWORD(wp) == ID_FIND)
-			do_find();
+		else if (LOWORD(wp) == ID_CLEARSOLO)
+			clear_solo();
 		else if (LOWORD(wp) == ID_METERMODE) {/* PRE fader (input) <-> POST fader (output) */
 			g_meter_post = !g_meter_post;
 			SetWindowTextA(g_metermode,
