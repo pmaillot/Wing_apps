@@ -37,7 +37,7 @@ gcc -O3 -Wall -o wpanel.exe wpanel.c -L../wapi -lwapi -lws2_32 -lgdi32 -mwindows
 
 Everything is two-way: changes made on the WING appear in the app, and changes made in the app are sent to the WING.
 
-**Link to source:** channels and aux strips show a small padlock at the upper right of the scribble strip: closed = linked to the source, open = not linked (the console's `clink` setting; `CLINK_LINKED` in the source sets which value counts as linked). Double-click the padlock to toggle it.
+**Link to source:** channels and aux strips show a small padlock at the upper right of the scribble strip: closed = linked to the source, open = not linked (the console's `clink` setting; `CLINK_LINKED` in the source sets which value counts as linked). Double-click the padlock to toggle it. This has an impact on the color and name displayed in the scribble.
 
 ### Meters
 
@@ -45,9 +45,13 @@ Each strip shows input L/R level LEDs (CLIP, -6, -12, -18, -30, -60 dB) plus DYN
 
 **DYN / GATE:** the DYN and GATE labels are yellow when that processor is switched on and grey when it is off; click a label to switch the processor (changes made on the WING appear here too). The red LED next to it lights while the console reports the gate closed / the dynamics acting (gate LED and dyn state meters), and the bar shows the gain reduction. Only input channels have a gate, so GATE is blank on AUX, BUS, MAIN and MTX strips.
 
+### ClrSolo
+
+A button that can be used to clear all currently enabled SOLO states
+
 ### Colours
 
-The scribble-strip colours use the console's 18 colour indices (RGB values sampled from the colour table in the WING Remote Protocols document, p. 249), in the `WCOL` table near the top of `wpanel.c`.
+The scribble-strip colours use the console' scribble LED state and 18 colour indices (RGB values sampled from the colour table in the WING Remote Protocols document, p. 249), in the `WCOL` table near the top of `wpanel.c`.
 
 This app has been co-written with the help of ClaudeAI, as an exercise to show AI is fully capable of grasping the Wing Remote Protocols document, and effectively extract methods and API protocol for using wapi, creating a working application without having to own/use a compiler on your PC. The app development spreaded over several days of adjusting and tweaking, ensuring Claude had a correct understanding of what I wanted to achieve. Claude's approach to WIN32 (GUI portions of the application) is different from what I would have coded, but is quite effective and so much faster than me doing it!
 I had to help Claude with fully understanding how to address metering, especially as it was originally using an older (and no longer accurate) version of the Wing Remote Protocols document.
