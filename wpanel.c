@@ -1,25 +1,28 @@
 /*
  * wpanel.c - a variable size strip remote panel for a Behringer WING, using wapi.
- * wpanel v 0.1.2 - (c) 2026 - Patrick-Gilles Maillot
+ * wpanel - (c) 2026 - Patrick-Gilles Maillot
  * Windows (Win32) GUI.
  *
  *   gcc -O3 -Wall -I<wapi include dir> -o wpanel.exe wpanel.c \
  *       -L<wapi lib dir> -lwapi -lws2_32 -lgdi32 -mwindows
  *
- * Layout: 12 strips in three groups of four, modelled on the console's own
+ * Layout: 12 strips in three groups of four, modeled on the console's own
  * surface. A row of bank buttons in the top bar chooses which sources the strips
- * show: CH 1-12, CH 13-24, CH 25-36, CH 37-40, AUX 1-8, BUS 1-8, BUS 9-16, MAIN 1-4 or MTX 1-8. Each strip has:
- *   - scribble strip: number, name and colour
- *   - SELECT button (click to select that source on the console)
+ * show: CH 1-12, CH 13-24, CH 25-36, CH 37-40, AUX 1-8, BUS 1-8, BUS 9-16, MAIN 1-4,
+ *       MTX 1-8, or DCA 1-16. Each strip has:
+ *   - scribble strip: number, name and color
+ *   - SELECT button (click to select that source on the console), grayed out for DCA
  *   - SOLO button (click to toggle solo)
- *   - MUTE button (click to mute / unmute; red = muted)
+ *   - MUTE button (click to mute / un-mute; red = muted)
  *   - fader with the WING dB scale and a numeric readout: drag the handle (or
  *     click the track) to set the level, double-click it for 0 dB
  *   - name: double-click the scribble strip to rename (Enter or clicking away
  *     to apply, Esc to cancel)
- * Everything is two-way: changes made on the WING show up here and vice versa.
+ *
+ * Almost everything is two-way: changes made on the WING show up here and vice versa.
  * The source currently selected on the console is highlighted and reported in
- * the top bar, whichever bank is showing.
+ * the top bar, whichever bank is showing. C-Link[sources] names &colors and Meters are
+ * WING->wpanel only
  *
  * Finding the console: with an empty address box, Connect calls
  * wOpen(""), which searches the network, connects to the first WING found and
@@ -44,6 +47,7 @@
  *          Added scribble lighting OFF state (LED = 0) and adapted the color based on the C-LINK state
  * v 0.1.3: Parameters tweaking
  *          DCA button/panel added
+ * v 0.1.4: Code cleanup
  */
 #include <math.h>
 #include <windows.h>
@@ -59,7 +63,7 @@
 #define EPSIL          0.001     /* epsilon value for float comparisons      */
 #define TICK_MS        25        /* event loop period                        */
 #define EVENT_WAIT_US  500       /* max time one tick waits for events (µs)  */
-#define MAX_EVENTS     512       /* wapi events buffer size                  */
+#define MAX_EVENTS     1024      /* events buffer (to support scene loading) */
 #define RESYNC_MS      5000      /* full re-read of every visible value      */
 #define RESYNC_WAIT_US 25000     /* per-token wait during a resync (µs)      */
 #define S_STRINGS      24        /* size of strings arrays                   */
@@ -79,8 +83,8 @@
 
 /* In Source below, 'name' is used to set name for un-linked channels, while 'dname'
  * is used to get $name, which truly represents what's displayed on the scribble (linked
- * or unlinked channel (see CLINK_LINKED). The colour follows the same logic: 'dcol'
- * ($col) is what is displayed, 'col' the strip's own setting. */
+ * or unlinked channel. The color follows the same logic: 'dcol' ($col) is what is displayed,
+ * 'col' the strip's own setting. */
 typedef struct {
 	wtoken mute, solo, name, col, fdr, dname, dyn_on, gate_on, clink, led, dcol;
 } Source;
@@ -89,9 +93,6 @@ static Source SRC[NSRC];
 #define HAS_DYN(s)  ((s) < 76)       /* DCAs (76..91) have no dynamics, nor meters, nor $name/$col */
 #define HAS_GATE(s) ((s) < 40)       /* only the input channels have a gate */
 #define HAS_LINK(s) ((s) < 48)       /* "link to source" exists on channels and aux only */
-#define CLINK_LINKED 1               /* value of the clink token when linked to the source
-                                      * (clink = "custom link"; with the value below the
-                                      * padlock is drawn closed) */
 
 /* wapi token definitions:
  *
@@ -144,6 +145,9 @@ static void init_sources(void) {
 #undef FAMILY
 }
 
+/* The wapi tokens of strip i in the current bank. */
+#define TOK(i) SRC[g_base + (i)]
+
 /* ---- banks: which sources the strips are showing ---------------------- */
 typedef struct {
 	const char *label;
@@ -162,7 +166,7 @@ static const Bank BANKS[] = {
 #define NSTRIP 4 * GROUP /* max number of strips shown at once (4 groups of 4) */
 
 /* ---- layout (pixels) ----------------------------------------------------- */
-#define WPANEL_VERSION "0.1.2"
+#define WPANEL_VERSION "0.1.4"
 #define WPANEL_TITLE   "wpanel - (c) 2026 - Patrick-Gilles Maillot - v " WPANEL_VERSION
 
 #define STRIP_W      90
@@ -174,7 +178,7 @@ static const Bank BANKS[] = {
 #define F_BTN        10           /* distance between families of buttons      */
 #define X_BTN        8
 #define W_BTN        (STRIP_W - 2 * X_BTN)
-#define LOCK_X       70           /* padlock on the scribble strip: offset from the strip x */
+#define LOCK_X       70           /* lock in scribble: offset from the strip x */
 #define LOCK_W       10
 #define LOCK_H       13
 #define Y_SCRIB      48           /* scribble button Y position                */
@@ -227,25 +231,26 @@ enum {
 /* WING color indices 1..18, taken from the colour table of the WING Remote
  * Protocols document (page 249). Index 0 is used while a colour is unknown. */
 #define NCOLORS 18
-static const COLORREF WCOL[NCOLORS + 1] = {RGB(64,  64,  68),   /*  0: unknown, or scribble light off */
-RGB(75, 100, 207),  /*  1                     */
-RGB(61, 130, 255),  /*  2                     */
-RGB(94, 60, 255),   /*  3                     */
-RGB(85, 204, 209),  /*  4                     */
-RGB(69, 176, 58),   /*  5                     */
-RGB(158, 202, 0),   /*  6                     */
-RGB(238, 221, 0),   /*  7                     */
-RGB(182, 107, 33),  /*  8                     */
-RGB(207, 42, 67),   /*  9                     */
-RGB(241, 125, 123), /* 10                     */
-RGB(240, 68, 249),  /* 11                     */
-RGB(158, 64, 255),  /* 12                     */
-RGB(244, 185, 25),  /* 13                     */
-RGB(92, 196, 255),  /* 14                     */
-RGB(239, 94, 53),   /* 15                     */
-RGB(104, 228, 163), /* 16                     */
-RGB(112, 112, 112), /* 17                     */
-RGB(224, 224, 224)  /* 18                     */
+static const COLORREF WCOL[NCOLORS + 1] = {
+RGB(64,  64,  68),  /*  0: scribble led off */
+RGB(75, 100, 207),  /*  1   */
+RGB(61, 130, 255),  /*  2   */
+RGB(94, 60, 255),   /*  3   */
+RGB(85, 204, 209),  /*  4   */
+RGB(69, 176, 58),   /*  5   */
+RGB(158, 202, 0),   /*  6   */
+RGB(238, 221, 0),   /*  7   */
+RGB(182, 107, 33),  /*  8   */
+RGB(207, 42, 67),   /*  9   */
+RGB(241, 125, 123), /* 10   */
+RGB(240, 68, 249),  /* 11   */
+RGB(158, 64, 255),  /* 12   */
+RGB(244, 185, 25),  /* 13   */
+RGB(92, 196, 255),  /* 14   */
+RGB(239, 94, 53),   /* 15   */
+RGB(104, 228, 163), /* 16   */
+RGB(112, 112, 112), /* 17   */
+RGB(224, 224, 224)  /* 18   */
 };
 
 /* Fader law read off the console's scale: dB -> 0..1 handle position. */
@@ -298,9 +303,6 @@ static int g_sel = -1;     /* selected source, 0..75 (0 = CH 1) */
 static char g_selname[S_STRINGS]; /* its name, when it is not on screen */
 static DWORD g_last_sync, g_keepalive;
 
-/* The wapi tokens of strip i in the current bank. */
-#define TOK(i) SRC[g_base + (i)]
-
 /* mouse interaction state */
 static int g_drag = -1; /* strip whose fader is being dragged */
 static int g_drag_dy; /* grab offset inside the handle (px) */
@@ -325,8 +327,7 @@ static int strip_x(int i) {
 /* Client width needed for n strips */
 static int client_width(int n) {
 	/* right edge of the last strip's buttons, plus a small right X_MARGIN */
-	int w = strip_x(n > 0 ? n - 1 : 0) + X_BTN + W_BTN + RIGHT_PAD;
-	return w;
+	return strip_x(n > 0 ? n - 1 : 0) + X_BTN + W_BTN + RIGHT_PAD;
 }
 
 /* y of bank button k: a small gap between CH / AUX / BUS / MAIN / MTX families */
@@ -334,8 +335,7 @@ static int bank_y(int k) {
 	static const int fam[6] = {4, 7, 8, 11, 12, 13}; /* first button of each group of banks */
 	int j, y = Y_SCRIB + k * (H_BTN + S_BTN);
 	for (j = 0; j < 6; j++)
-		if (k >= fam[j])
-			y += F_BTN;
+		if (k >= fam[j]) y += F_BTN;
 	return y;
 }
 
@@ -478,17 +478,13 @@ static int sel_index(int v) {
 
 /* The selected source's name, when it is not one of the strips on screen. */
 static void refresh_selname(void) {
-	char buf[256];
+	char buf[S_STRINGS];
 	int vis = g_sel - g_base;
 
 	g_selname[0] = '\0';
 	if (!g_connected || g_sel < 0 || g_sel >= NSRC) return;
 	if (vis >= 0 && vis < g_nvis) return;
-	buf[0] = '\0';
-	if (wGetTokenStringTimed(SRC[g_sel].name, buf, RESYNC_WAIT_US) > 0) {
-		buf[sizeof buf - 1] = '\0';
-		snprintf(g_selname, sizeof g_selname, "%s", buf);
-	}
+	if (wGetTokenStringTimed(SRC[g_sel].name, buf, RESYNC_WAIT_US) == WSUCCESS) snprintf(g_selname, sizeof g_selname, "%s", buf);
 }
 
 static void set_sel(int idx) {
@@ -502,8 +498,7 @@ static void set_sel(int idx) {
 }
 
 static void reset_strips(void) {
-	int i;
-	for (i = 0; i < NSTRIP; i++) {
+	for (int i = 0; i < NSTRIP; i++) {
 		g_mute[i] = g_solo[i] = g_col[i] = g_led[i] = -1;
 		g_fdr_ok[i] = 0;
 		g_fdr[i] = 0;
@@ -520,8 +515,7 @@ static void reset_strips(void) {
 
 /* Forget meter values (after switching PRE/POST). */
 static void reset_strips_meters(void) {
-	int i;
-	for (i = 0; i < NSTRIP; i++) {
+	for (int i = 0; i < NSTRIP; i++) {
 		g_lvl[i][0] = g_lvl[i][1] = NO_LEVEL;
 		g_clip_until[i][0] = g_clip_until[i][1] = 0;
 		g_gate_gr[i] = g_dyn_gr[i] = 0.0f;
@@ -557,6 +551,18 @@ static void disconnect(const char *why) {
 	update_clrsolo(); /* back to grey */
 }
 
+/* Read one strip's color/led */
+static void refresh_col(int i) {
+	int v;
+	if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) == WSUCCESS) set_col(i, v);
+	if (wGetTokenIntTimed(TOK(i).led, &v, RESYNC_WAIT_US) == WSUCCESS) set_led(i, v ? 1 : 0); /* no $led token exists */
+}
+/* Read on strip's name */
+static void refresh_name(int i) {
+	char buf[S_STRINGS];
+	if (wGetTokenStringTimed(TOK(i).dname, buf, RESYNC_WAIT_US) == WSUCCESS) set_name(i, buf);
+}
+
 /* Read every value of the visible strips from the console. The wapi getters
  * return WSUCCESS (1) when the value was read, so a timeout or error (0 or
  * negative) leaves the displayed value alone. Stops at the first or second token
@@ -564,51 +570,22 @@ static void disconnect(const char *why) {
 static void read_all(void) {
 	int i, v;
 	float f;
-	char buf[S_STRINGS];
 
 	for (i = 0; i < g_nvis; i++) {
-		if (wGetTokenIntTimed(TOK(i).mute, &v, RESYNC_WAIT_US) != WSUCCESS)
-			if (wGetTokenIntTimed(TOK(i).mute, &v, RESYNC_WAIT_US) != WSUCCESS) return;
-		set_mute(i, v);
-		if (wGetTokenIntTimed(TOK(i).solo, &v, RESYNC_WAIT_US) != WSUCCESS)
-			if (wGetTokenIntTimed(TOK(i).solo, &v, RESYNC_WAIT_US) != WSUCCESS)return;
-		set_solo(i, v ? 1 : 0);
-		if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) != WSUCCESS)
-			if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) != WSUCCESS) return;
-		set_col(i, v);
-		if (wGetTokenIntTimed(TOK(i).led, &v, RESYNC_WAIT_US) == WSUCCESS) set_led(i, v ? 1 : 0);
-		if (wGetTokenFloatTimed(TOK(i).fdr, &f, RESYNC_WAIT_US) != WSUCCESS)
-			if (wGetTokenFloatTimed(TOK(i).fdr, &f, RESYNC_WAIT_US) != WSUCCESS) return;
-		if (i != g_drag) set_fdr(i, f); /* don't fight the mouse */
+		if (wGetTokenIntTimed(TOK(i).mute, &v, RESYNC_WAIT_US) == WSUCCESS) set_mute(i, v);
+		if (wGetTokenIntTimed(TOK(i).solo, &v, RESYNC_WAIT_US) == WSUCCESS) set_solo(i, v ? 1 : 0);
+		if (i != g_drag && wGetTokenFloatTimed(TOK(i).fdr, &f, RESYNC_WAIT_US) == WSUCCESS) set_fdr(i, f); /* don't fight the mouse */
 		if (HAS_DYN(g_base + i) && wGetTokenIntTimed(TOK(i).dyn_on, &v, RESYNC_WAIT_US) == WSUCCESS) set_dyn_on(i, v ? 1 : 0);
-		if (HAS_GATE(g_base + i) && wGetTokenIntTimed(TOK(i).gate_on, &v, RESYNC_WAIT_US) == WSUCCESS)
-		set_gate_on(i, v ? 1 : 0);
-		if (HAS_LINK(g_base + i) && wGetTokenIntTimed(TOK(i).clink, &v, RESYNC_WAIT_US) == WSUCCESS)
-			set_link(i, v ? 1 : 0);
-		buf[0] = '\0';
-		if (wGetTokenStringTimed(TOK(i).dname, buf, RESYNC_WAIT_US) == WSUCCESS) {
-			buf[sizeof buf - 1] = '\0';
-			set_name(i, buf); /* a failed read must not blank the name */
-		}
+		if (HAS_GATE(g_base + i) && wGetTokenIntTimed(TOK(i).gate_on, &v, RESYNC_WAIT_US) == WSUCCESS) set_gate_on(i, v ? 1 : 0);
+		if (HAS_LINK(g_base + i) && wGetTokenIntTimed(TOK(i).clink, &v, RESYNC_WAIT_US) == WSUCCESS) set_link(i, v ? 1 : 0);
+		refresh_name(i);
+		refresh_col(i);
 	}
 	if (wGetTokenIntTimed($STAT_SOLO, &v, RESYNC_WAIT_US) == WSUCCESS) g_stat_solo = v ? 1 : 0;
 	if (wGetTokenIntTimed($CTL_$STAT_SELIDX, &v, RESYNC_WAIT_US) == WSUCCESS) set_sel(sel_index(v));
 }
 
-/* Re-read one strip's name (used when the console reports a name change). */
-static void refresh_col(int i) {
-	int v;
-	if (wGetTokenIntTimed(TOK(i).dcol, &v, RESYNC_WAIT_US) == WSUCCESS) set_col(i, v);
-	if (wGetTokenIntTimed(TOK(i).led, &v, RESYNC_WAIT_US) == WSUCCESS) set_led(i, v ? 1 : 0); /* no $led token exists */
-}
-static void refresh_name(int i) {
-	char buf[256];
-	buf[0] = '\0';
-	if (wGetTokenStringTimed(TOK(i).dname, buf, RESYNC_WAIT_US) == WSUCCESS) {
-		buf[sizeof buf - 1] = '\0';
-		set_name(i, buf);
-	}
-}
+
 
 /* ---- connecting ---------------------------------------------------------- */
 /* With an empty address, wOpen() searches the local network itself, connects to
@@ -617,7 +594,6 @@ static void refresh_name(int i) {
 static void do_connect(void) {
 	char ip[S_STRINGS]; /* receives the IP when searching (an IPv4 address needs 16 bytes at most) */
 	int searching;
-//	int searching, rc;
 
 	if (g_connected) {
 		disconnect("Disconnected");
@@ -627,21 +603,15 @@ static void do_connect(void) {
 	memset(ip, 0, sizeof ip);
 	GetWindowTextA(g_ip, ip, sizeof ip);
 	searching = (ip[0] == '\0');
-	set_status( searching ?
-					"Searching for a WING on the network..." :
-					"Connecting...");
+	set_status( searching ? "Searching for a WING on the network..." : "Connecting...");
 	UpdateWindow(g_status);
 
 /* wOpen() returns WSUCCESS (1) on success, a negative werror code otherwise. */
 	if (wOpen(ip) != WSUCCESS) {;
-//	if (!WOPEN_SUCCEEDED(rc)) {
-		set_status( searching ?
-						"No WING found. Type its IP address." :
-						"Could not connect. Check IP and network.");
+		set_status( searching ? "No WING found. Type its IP address." : "Could not connect. Check IP and network.");
 		return;
 	}
-	if (searching)
-		SetWindowTextA(g_ip, ip); /* show the address that was found */
+	if (searching) SetWindowTextA(g_ip, ip); /* show the address that was found */
 	g_connected = 1;
 	SetWindowTextA(g_connect, "Disconnect");
 	read_all();
@@ -669,13 +639,12 @@ static void invalidate_meters(void) {
  * strip index); its records add the gate LED and the dyn state. */
 static int meter_bit(int s) {
 	if (s >= 76) return 80 + (s - 76); /* DCA (V1 family, bytes 10-11): in/out words only */
-	/* The 29-byte table in the documentation puts the V2 families at bytes 19-28;
-	 * the console's mask is 30 bytes long and the V2 families sit one byte later. */
-	if (s < 40) return 160 + s; /* channel V2: bytes 20-24 */
+	/* The 30-byte table in the documentation puts the V2 families at bytes 20-29; */
+	if (s < 40) return 160 + s;        /* channel V2: bytes 20-24 */
 	if (s < 48) return 200 + (s - 40); /* aux V2:     byte 25     */
 	if (s < 64) return 208 + (s - 48); /* bus V2:     bytes 26-27 */
 	if (s < 68) return 224 + (s - 64); /* main V2:    byte 28     */
-	return 232 + (s - 68); /* matrix V2:  byte 29     */
+	return 232 + (s - 68);             /* matrix V2:  byte 29     */
 }
 
 static void start_meters(void) {
@@ -759,8 +728,7 @@ static void parse_meters(const unsigned char *buf, int len) {
 		g_dyn_gr[i] = dg < 100.0f ? dg : 0.0f;
 		g_gate_eng[i] = HAS_GATE(g_base + i) && be16(d + 12) == 1;
 		g_dyn_eng[i] = dyn && be16(d + 18) == 1;
-		if (og != (int) g_gate_gr[i] || od != (int) g_dyn_gr[i]
-				|| oge != g_gate_eng[i] || ode != g_dyn_eng[i])
+		if (og != (int) g_gate_gr[i] || od != (int) g_dyn_gr[i] || oge != g_gate_eng[i] || ode != g_dyn_eng[i])
 			g_meter_dirty = 1;
 	}
 }
@@ -768,18 +736,19 @@ static void parse_meters(const unsigned char *buf, int len) {
 static void pump_meters(void) {
 	unsigned char buf[1024];
 	int len, n = 0;
+	unsigned int ticknow = GetTickCount();
 
 	if (!g_meter_ok) return;
-	if (GetTickCount() - g_meter_renew >= METER_RENEW_MS) {
+	if (ticknow - g_meter_renew >= METER_RENEW_MS) {
 		wRenewMeters(g_meter_id); /* the console stops after 5 s otherwise */
-		g_meter_renew = GetTickCount();
+		g_meter_renew = ticknow;
 	}
 	while (n++ < 8 && (len = wGetMeters(buf, sizeof buf, METER_WAIT_US)) > 0)
 		parse_meters(buf, len);
 
-	if (g_meter_dirty && GetTickCount() - g_meter_drawn >= METER_REPAINT_MS) {
-		g_meter_dirty = 0; /* repaint only when something changed,   */
-		g_meter_drawn = GetTickCount(); /* and at most ~25 times per second       */
+	if (g_meter_dirty && ticknow - g_meter_drawn >= METER_REPAINT_MS) {
+		g_meter_dirty = 0;        /* repaint only when something changed,   */
+		g_meter_drawn = ticknow;  /* and at most ~25 times per second       */
 		invalidate_meters();
 	}
 }
@@ -799,8 +768,7 @@ static void update_clrsolo(void) {
 
 	if (g_connected) {
 		active = (g_stat_solo == 1);
-		for (i = 0; i < g_nvis; i++)
-			if (g_solo[i] == 1) active = 1;
+		for (i = 0; i < g_nvis; i++) if (g_solo[i] == 1) active = 1;
 	}
 	if (active != g_clr_shown) {
 		g_clr_shown = active;
@@ -866,8 +834,8 @@ static void pump_events(void) {
 		}
 		for (k = 0; k < n; k++) {
 			handle_event(&tv[k]);
-			if (tv[k].type == S32 && tv[k].d.sdata) /* wapi allocates strings */
-				free(tv[k].d.sdata);
+			/* free wapi storage if needed */
+			if (tv[k].type == S32 && tv[k].d.sdata) free(tv[k].d.sdata);
 		}
 	} while (n == MAX_EVENTS);
 
@@ -961,9 +929,7 @@ static double db_from_t(double t) /* inverse of fader_t() */
 	if (t >= 1.0)   return 10.0;
 	for (k = 1; k < NSC; k++)
 		if (t <= SC_T[k])
-			return SC_DB[k - 1]
-					+ (SC_DB[k] - SC_DB[k - 1]) * (t - SC_T[k - 1])
-							/ (SC_T[k] - SC_T[k - 1]);
+			return SC_DB[k - 1] + (SC_DB[k] - SC_DB[k - 1]) * (t - SC_T[k - 1]) / (SC_T[k] - SC_T[k - 1]);
 	return 10.0;
 }
 
@@ -983,8 +949,7 @@ static void drag_fader(int y) {
 	db = db_from_t(t);
 	if (db > -144.0) {
 		db = (int) (db * 10.0 + (db >= 0 ? 0.5 : -0.5)) / 10.0; /* 0.1 dB steps */
-		if (db > -0.4 && db < 0.4)
-			db = 0.0; /* snap to unity */
+		if (db > -0.4 && db < 0.4) db = 0.0;                    /* snap to unity */
 	}
 	if (((float) db > g_drag_sent - EPSIL) && ((float) db < g_drag_sent + EPSIL)) return; /* nothing new to send */
 	g_drag_sent = (float) db;
@@ -1049,29 +1014,23 @@ static void start_edit(int i) {
 }
 
 /* ---- mouse hit-testing --------------------------------------------------- */
-enum {
-	Z_NONE, Z_SCRIB, Z_SEL, Z_SOLO, Z_MUTE, Z_FDR, Z_DYN, Z_GATE, Z_LINK
-};
+enum {Z_NONE, Z_SCRIB, Z_SEL, Z_SOLO, Z_MUTE, Z_FDR, Z_DYN, Z_GATE, Z_LINK};
 
 static int hit(int x, int y, int *zone) {
 	int i;
 	*zone = Z_NONE;
 	for (i = 0; i < g_nvis; i++) {
 		int sx = strip_x(i), bx = sx + X_BTN;
-		if (x < sx || x >= sx + STRIP_W)
-			continue;
+		if (x < sx || x >= sx + STRIP_W) continue;
 		if (HAS_LINK(g_base + i) && x >= sx + LOCK_X - 3 && x < sx + LOCK_X + LOCK_W + 3
-				&& y >= Y_SCRIB && y < Y_SCRIB + LOCK_H + 8)                      *zone = Z_LINK;
-		else if (y >= Y_SCRIB && y < Y_SCRIB + H_SCRIB)                           *zone = Z_SCRIB;
-		else if (x >= bx && x < bx + W_BTN && y >= Y_SEL && y < Y_SEL + H_SEL)    *zone = Z_SEL;
+				&& y >= Y_SCRIB && y < Y_SCRIB + LOCK_H + 8)                       *zone = Z_LINK;
+		else if (y >= Y_SCRIB && y < Y_SCRIB + H_SCRIB)                            *zone = Z_SCRIB;
+		else if (x >= bx && x < bx + W_BTN && y >= Y_SEL && y < Y_SEL + H_SEL)     *zone = Z_SEL;
 		else if (x >= bx && x < bx + W_BTN && y >= Y_SOLO && y < Y_SOLO + H_SOLO)  *zone = Z_SOLO;
-		else if (x >= bx && x < bx + W_BTN && y >= Y_MUTE && y < Y_MUTE + H_MUTE) *zone = Z_MUTE;
-		else if (x >= bx && x < bx + 30 && y >= Y_METER + 2 && y < Y_METER + 16 && HAS_DYN(g_base + i))  *zone = Z_DYN;
-		else if (x >= bx&& x < bx + 30 && y >= Y_METER + 80 && y < Y_METER + 94 && HAS_GATE(g_base + i))
-			*zone = Z_GATE;
-		else if (x >= sx + 11 && x < sx + 51 && y >= Y_FDR_TOP - H_FDR_EXT
-				&& y <= Y_FDR_BOT + H_FDR_EXT)
-			*zone = Z_FDR;
+		else if (x >= bx && x < bx + W_BTN && y >= Y_MUTE && y < Y_MUTE + H_MUTE)  *zone = Z_MUTE;
+		else if (x >= bx && x < bx + 30 && y >= Y_METER + 2 && y < Y_METER + 16 && HAS_DYN(g_base + i))   *zone = Z_DYN;
+		else if (x >= bx&& x < bx + 30 && y >= Y_METER + 80 && y < Y_METER + 94 && HAS_GATE(g_base + i))  *zone = Z_GATE;
+		else if (x >= sx + 11 && x < sx + 51 && y >= Y_FDR_TOP - H_FDR_EXT && y <= Y_FDR_BOT + H_FDR_EXT) *zone = Z_FDR;
 		return i;
 	}
 	return -1;
@@ -1082,11 +1041,9 @@ static void click(int x, int y) {
 	int zone, i;
 
 	SetFocus(g_wnd); /* commits a name being edited */
-	if (!g_connected)
-		return;
+	if (!g_connected) return;
 	i = hit(x, y, &zone);
-	if (i < 0)
-		return;
+	if (i < 0) return;
 
 	switch (zone) {
 	case Z_SEL:
@@ -1123,13 +1080,13 @@ static void click(int x, int y) {
 static void dblclick(int x, int y) {
 	int zone, i;
 
-	if (!g_connected)      return;
+	if (!g_connected) return;
 	i = hit(x, y, &zone);
 	if (i < 0) return;
-	if (zone == Z_LINK)     toggle_link(i);   /* a single click does nothing here */
+	if (zone == Z_LINK)       toggle_link(i);   /* a single click does nothing here */
 	else if (zone == Z_SCRIB) start_edit(i);
-	else if (zone == Z_FDR) send_fader(i, 0.0);
-	else                    click(x, y); /* fast double-tap on a button */
+	else if (zone == Z_FDR)   send_fader(i, 0.0);
+	else                      click(x, y);      /* fast double-tap on a button */
 }
 
 /* ---- banks --------------------------------------------------------------- */
@@ -1191,9 +1148,7 @@ static double fader_t(double db) {
 	if (db >= SC_DB[NSC - 1]) return 1.0;
 	for (k = 1; k < NSC; k++)
 		if (db <= SC_DB[k])
-			return SC_T[k - 1]
-					+ (SC_T[k] - SC_T[k - 1]) * (db - SC_DB[k - 1])
-							/ (SC_DB[k] - SC_DB[k - 1]);
+			return SC_T[k - 1] + (SC_T[k] - SC_T[k - 1]) * (db - SC_DB[k - 1]) / (SC_DB[k] - SC_DB[k - 1]);
 	return 1.0;
 }
 
@@ -1246,13 +1201,12 @@ static void draw_meter(HDC dc, int i, int x) {
 		}
 		fill_rect(dc, x + 2, y, 20, 8, on0 ? lit[k] : RGB(46, 48, 52));
 		fill_rect(dc, x + 52, y, 20, 8, on1 ? lit[k] : RGB(46, 48, 52));
-		text(dc, g_tiny, RGB(200, 200, 200), x + 22, y - 2, 30, 12,
-				DT_CENTER | DT_VCENTER, lab[k]);
+		text(dc, g_tiny, RGB(200, 200, 200), x + 22, y - 2, 30, 12, DT_CENTER | DT_VCENTER, lab[k]);
 	}
 	gr_row(dc, x, Y_METER + 80, "GATE", g_gate_gr[i], 20.0f, g_gate_eng[i], g_gate_on[i], HAS_GATE(g_base + i));
 }
 
-/* Small padlock: closed = linked to the source, open = custom (not linked). */
+/* Small lock: closed = linked to the source, open = custom (not linked). */
 static void draw_lock(HDC dc, int x, int y, int linked, COLORREF c) {
 	fill_rect(dc, x, y + 6, LOCK_W, 7, c);               /* body */
 	fill_rect(dc, x + 2, y, 6, 2, c);                    /* shackle: top bar */
@@ -1268,8 +1222,8 @@ static void draw_strip(HDC dc, int i) {
 	COLORREF mc = g_mute[i] == 1 ? C_MUTED : g_mute[i] == 0 ? C_LIVE : C_UNKNOWN;
 	char buf[32];
 	/* dark text on light colours, white text on dark ones */
-	COLORREF tc = (299 * GetRValue(sc) + 587 * GetGValue(sc) + 114 * GetBValue(sc))
-					/ 1000 > 150 ? RGB(20, 20, 20) : RGB(255, 255, 255);
+	COLORREF tc = (299 * GetRValue(sc) + 587 * GetGValue(sc) + 114 * GetBValue(sc)) / 1000 > 150 ?
+			RGB(20, 20, 20) : RGB(255, 255, 255);
 
 	/* scribble strip (white outline when this is the selected source) */
 	fill_rect(dc, sx + 1, Y_SCRIB - 3, STRIP_W - 2, H_SCRIB + 6, sel ? RGB(255, 255, 255) : C_BG);
@@ -1279,11 +1233,10 @@ static void draw_strip(HDC dc, int i) {
 	text(dc, g_font, tc, sx + 6, Y_SCRIB + 24, STRIP_W - 12, 32,
 	DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS, g_name[i]);
 
-	if (HAS_LINK(g_base + i) && g_link[i] >= 0)
-		draw_lock(dc, sx + LOCK_X, Y_SCRIB + 4, g_link[i] == CLINK_LINKED, tc);
+	if (HAS_LINK(g_base + i) && g_link[i] >= 0) draw_lock(dc, sx + LOCK_X, Y_SCRIB + 4, g_link[i] != 0, tc);
 
 	/* SELECT / SOLO / MUTE */
-	if (g_base + i >= 76) /* a DCA cannot be selected: greyed out */
+	if (g_base + i >= 76) /* a DCA cannot be selected: grayed out */
 		button(dc, bx, Y_SEL, W_BTN, H_SEL, RGB(150, 150, 152), RGB(110, 110, 112), "SELECT");
 	else
 		button(dc, bx, Y_SEL, W_BTN, H_SEL, sel ? C_SELECT : C_DARK, sel ? RGB(0, 0, 0) : RGB(255, 255, 255), "SELECT");
@@ -1421,8 +1374,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			BS_OWNERDRAW,
 			X_MARGIN, bank_y(k), BANK_W, 28, hwnd, ID_BANK0 + k);
 
-		g_sellbl = make("STATIC", "Selected:\r\n--", 0,
-		X_MARGIN, bank_y(NBANK - 1) + 36, BANK_W, Y_STATUS - bank_y(NBANK - 1) - 40, hwnd, ID_SELLBL);
+		g_sellbl = make("STATIC", "Selected:\r\n--", 0, X_MARGIN, bank_y(NBANK - 1) + 36,
+				BANK_W, Y_STATUS - bank_y(NBANK - 1) - 40, hwnd, ID_SELLBL);
 		SendMessage(g_sellbl, WM_SETFONT, (WPARAM) g_font, TRUE);
 		g_status = make("STATIC", "Not connected", 0,
 		X_MARGIN, Y_STATUS, 680, H_STATUS, hwnd, ID_STATUS);
@@ -1452,16 +1405,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		return 0;
 
 	case WM_MOUSEMOVE:
-		if (g_drag >= 0 && (wp & MK_LBUTTON))
-			drag_fader((short) HIWORD(lp));
+		if (g_drag >= 0 && (wp & MK_LBUTTON)) drag_fader((short) HIWORD(lp));
 		return 0;
 
 	case WM_LBUTTONUP:
 	case WM_CAPTURECHANGED:
 		if (g_drag >= 0) {
 			g_drag = -1;
-			if (GetCapture() == hwnd)
-				ReleaseCapture();
+			if (GetCapture() == hwnd) ReleaseCapture();
 		}
 		return 0;
 
@@ -1496,23 +1447,19 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	}
 
 	case WM_COMMAND:
-		if (LOWORD(wp) == ID_CONNECT)
-			do_connect();
-		else if (LOWORD(wp) == ID_CLEARSOLO)
-			clear_solo();
-		else if (LOWORD(wp) == ID_METERMODE) {/* PRE fader (input) <-> POST fader (output) */
+		if (LOWORD(wp) == ID_CONNECT)        do_connect();
+		else if (LOWORD(wp) == ID_CLEARSOLO) clear_solo();
+		else if (LOWORD(wp) == ID_METERMODE) {
+			/* PRE fader (input) <-> POST fader (output) */
 			g_meter_post = !g_meter_post;
-			SetWindowTextA(g_metermode,
-					g_meter_post ? "Meters: POST" : "Meters: PRE");
+			SetWindowTextA(g_metermode, g_meter_post ? "Meters: POST" : "Meters: PRE");
 			reset_strips_meters();
-		} else if (LOWORD(wp) >= ID_BANK0 && LOWORD(wp) < ID_BANK0 + NBANK &&
-		HIWORD(wp) == BN_CLICKED)
+		} else if (LOWORD(wp) >= ID_BANK0 && LOWORD(wp) < ID_BANK0 + NBANK && HIWORD(wp) == BN_CLICKED)
 			set_bank(LOWORD(wp) - ID_BANK0);
 		return 0;
 
 	case WM_TIMER:
-		if (wp == ID_TIMER && g_connected)
-			pump_events();
+		if (wp == ID_TIMER && g_connected) pump_events();
 		return 0;
 
 	case WM_DESTROY:
